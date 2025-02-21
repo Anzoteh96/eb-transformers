@@ -1,0 +1,3 @@
+fname_prefix,dmodel,dinput,batch,theta_max,seqlen,weight_share,prior,alpha,dirich_prob,mixture_level,theta_max_israndom,step,layers,heads,activation,norm_share,decoding_layer_norm,train_steps,train_lr,train_lr_epoch,train_lr_gamma,uniform_prior,nohist_thetas,keep_stdout,tqdm_disable,device,dtype
+T24,32,1,192,50,512,2,mixture,50.0,0.5,batch,False,0.5,18,16,gelu,False,True,50000,0.02,300,0.9,False,True,False,False,cuda,torch.float32
+T18,32,1,192,50,512,2,mixture,50.0,0.5,batch,False,0.5,24,8,gelu,False,True,50000,0.02,300,0.9,False,True,False,False,cuda,torch.float32
