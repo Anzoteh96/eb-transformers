@@ -1,3 +1,7 @@
+# Solving Empirical Bayes via Transformers
+
+This work is from our [paper](https://arxiv.org/abs/2502.09844). 
+
 ## Selected Models
 
 The selected models are stored with their hyperparameters in `./selected_models/`.
@@ -79,7 +83,7 @@ python train_layer_decoder.py --inputactivations [path to a picke file that cont
 
 ### Baseball
 
-Raw data obtained  [from](https://www.retrosheet.org/game.htm) processed using  [this API](https://github.com/calestini/retrosheet). Save the files into `datasets/baseball`. 
+Raw data obtained [here](https://www.retrosheet.org/game.htm) processed using  [this API](https://github.com/calestini/retrosheet). Save the files into `datasets/baseball`. 
 Then, run `baseball_preprocess.py` (renaming variables `a` and `b` to your choice), and then run the following: 
 
 ```
@@ -88,7 +92,7 @@ python baseball_data.py --model [model] --pos [bat or pitch] --data_dir' [path t
 
 
 ### Hockey
-Raw data are obtain [from] (https://www.hockey-reference.com/leagues/NHL_2019_skaters.html) (for the 2018-2019 season; the rest may be proceeded similarly). 
+Raw data are obtain [here](https://www.hockey-reference.com/leagues/NHL_2019_skaters.html) (for the 2018-2019 season; the rest may be proceeded similarly). 
 The files should be stored as `datasets/hockey/season_2019.csv`. After that, we run the program: 
 ```
 python hockey_data.py --model [model] --data_dir datasets/hockey --prev_year [X] --next_year [X + 1]
