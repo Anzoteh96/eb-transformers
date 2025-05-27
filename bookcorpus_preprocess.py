@@ -1,5 +1,4 @@
 import numpy as np
-# import tiktoken
 import os
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -23,28 +22,6 @@ def get_token_stats(fullpath, plotpath, num_word_threshold = None):
     docs  = vectorizer.fit_transform(words) # L x T, M[i, j] = frequency of token j in line i.
     features = vectorizer.get_feature_names_out() # size T.
     visualizer = FreqDistVisualizer(features=features, orient='v', n = 50)
-    """
-    encoding = tiktoken.get_encoding('cl100k_base')
-    codes = []
-    for line in words:
-        code_here = encoding.encode(line)
-        decoded_tokens = [encoding.decode([token_id]) for token_id in code_here]
-        code_filtered = [code for code in code_here if encoding.decode([code]).lower() not in stop_words]
-        codes.append(code_filtered)
-    #codes = [encoding.encode(line) for line in words]
-    # Step 1: Find all unique numbers and create a mapping
-    unique_numbers = sorted(set(num for sublist in codes for num in sublist))
-    num_to_index = {num: i for i, num in enumerate(unique_numbers)}
-    features = [encoding.decode([token_id]) for token_id in unique_numbers]
-
-    # Step 2: Initialize a 2D array
-    docs = np.zeros((len(codes), len(unique_numbers)), dtype=int)
-
-    # Step 3: Populate the array
-    for i, sublist in enumerate(codes):
-        for num in sublist:
-            docs[i, num_to_index[num]] += 1
-"""
     if num_word_threshold is not None:
         num_tokens = np.array(docs.sum(axis = 1)).flatten()
         partition_ind = np.sum(np.cumsum(num_tokens) < num_word_threshold)
@@ -71,31 +48,12 @@ def get_token_stats(fullpath, plotpath, num_word_threshold = None):
     #plt.clf()
     return freq_df
 
-"""
-def get_token_stats(fullpath, plotpath):
-    # Readthe file first.
-    # Let L be the number of lines, and T be the number of distinct tokens.
-    with open(fullpath, "r") as f:
-         words = [line for line in f] # length L.
-    # Next, we want to count the tokens, with stopwords removed.
-    vectorizer = CountVectorizer(stop_words='english')
-    docs  = vectorizer.fit_transform(words) # L x T, M[i, j] = frequency of token j in line i.
-    features = vectorizer.get_feature_names_out() # size T.
-    freq = np.array(docs.sum(axis = 0)).flatten() # size T.
-    freq_df = pd.DataFrame({"Tokens": features, "Frequency": freq}).sort_values(by = 'Frequency', ascending = False)
-    visualizer = FreqDistVisualizer(features=features, orient='v', n = 50)
-    visualizer.fit(docs)
-    visualizer.show()
-    plt.savefig(plotpath)
-    plt.clf()
-    return freq_df
-"""
 
 if __name__ == "__main__":
-    input_folder = "bookcorpusopen/files"
-    plot_folder = "bookcorpusopen/plots"
-    df_folder = "bookcorpusopen/dataframes_countvec"
+    input_folder = "../bookcorpusopen/files"
     
+    plot_folder = "bookcorpus/plot"
+    df_folder = "bookcorpus/dataframes_countvec"
     
     for file in tqdm(os.listdir(input_folder)):
         fullpath = os.path.join(input_folder, file)
@@ -106,7 +64,7 @@ if __name__ == "__main__":
     #    freq_df = get_token_stats(fullpath, plotpath, 2000)
     #    freq_df.to_csv(dfpath)
         try:
-            freq_df = get_token_stats(fullpath, plotpath, 2000) # Change to 2000 maybe? 
+            freq_df = get_token_stats(fullpath, plotpath, 2000) 
             freq_df.to_csv(dfpath)
         except:
             print(file_name)

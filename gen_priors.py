@@ -36,19 +36,20 @@ def gen_random_nn(args):
         return out.detach();
     return nn
 
-# (Dec 2024 version). 
 # Here we want to add a way to get random theta max. 
 # For now, we just use N(mu, 0), Exp(mu), and Cauchy. 
 def gen_random_thetamax(mu, std, size):
     # Mixture of 3
-    thetamax1 = torch.clamp(torch.empty(size).normal_(mu, std), min = 0.2 * mu, max = 3.0 * mu)
-    thetamax2 = torch.clamp(torch.empty(size).exponential_(1 / mu), min = 0.2 * mu, max = 3.0 * mu)
-    thetamax3 = torch.clamp(torch.empty(size).cauchy_(mu, std), min = 0.2 * mu, max = 3.0 * mu)
+    thetamax1 = torch.rand(size) * (4.0 * mu) # I.e. normally (0, 200)
+    # Now we need to sample from exponential and cauchy, but here's a catch: 
+    # the heavy tail might give us unstable training results, so we need to clamp it. 
+    thetamax2 = torch.clamp(torch.empty(size).exponential_(1 / mu), min = 0.00, max = 10.0 * mu)
+    thetamax3 = torch.clamp(torch.empty(size).cauchy_(mu, std), min = 0.00, max = 10.0 * mu)
     inds = torch.multinomial(torch.tensor([0.75, 0.125, 0.125]), size, replacement=True)
     answer = torch.empty(size)
     answer[inds == 0] = thetamax1[inds == 0]
-    answer[inds == 1] = thetamax1[inds == 1]
-    answer[inds == 2] = thetamax1[inds == 2]
+    answer[inds == 1] = thetamax2[inds == 1]
+    answer[inds == 2] = thetamax3[inds == 2]
     return answer
 
 # Here, we consolidate everything to make it a neural prior. 
@@ -79,6 +80,8 @@ class NeuralPrior():
     def gen_bayes_est(self, inputs):
         if self.dinput > 1:
             raise NotImplementedError
+        # TODO: this is slow bc we gonna sample it repeatedly. 
+        # Can we possibly pass in a new "batch" param into gen_thetas?
         labels = torch.concatenate([self.gen_thetas() for _ in range(1000)]) # Tried 20000 but got OOM. 
         mu = labels.flatten()
         lambdas = torch.ones(mu.shape[0]).to(labels.device) / mu.shape[0]
@@ -145,14 +148,22 @@ class Multinomial():
         self.atoms = args.atoms.to(args.device)
         self.probs = args.probs.to(args.device)
 
-    def gen_thetas(self, seed = None):
+    def gen_thetas(self, seed = None, with_prob = False):
         args = self.args 
         batch, seqlen, dinput = args.batch, args.seqlen, args.dinput  
         inds = torch.multinomial(self.probs, batch * seqlen * dinput, replacement = True).reshape(batch, seqlen, dinput)
         thetas = self.atoms[inds]
-        return thetas 
+        if with_prob:
+            probs = self.probs[inds]
+            return thetas, probs
+        else:
+            return thetas 
+
+    def gen_theta_with_probs(self, seed = None):
+        return self.gen_thetas(self, seed, with_prob = True)
 
     def gen_bayes_est(self, inputs):
+        # TODO: this is better approximated via direct computation instead of sampling a lot of those. 
         mu = self.atoms 
         lambdas = self.probs
         bayes_est = eval_regfunc(mu, lambdas, inputs.flatten()).reshape(inputs.shape)
@@ -161,7 +172,7 @@ class Multinomial():
 # Below is Prior on prior for multinomials, where the atoms are fixed but the probability follows dirichlet distribution. 
 class RandMultinomial(Multinomial):
     def __init__(self, args):
-        args.atoms = torch.linspace(0.1, args.theta_max, steps = 10 * args.theta_max)
+        args.atoms = torch.linspace(0.1, args.theta_max, steps = int(10 * args.theta_max))
         N = args.atoms.shape[0]
         args.probs = Dirichlet(torch.ones(N)).sample()
         super().__init__(args)
@@ -178,7 +189,8 @@ class ZipfPrior(Multinomial):
         super().__init__(args)
 
 
-# Here we have the generator fn for worstprior. 
+# Here we have the generator fn for worstprior. This most likely would require loading from a file 
+# as the worstprior has to be pre-computed. 
 class WorstPrior():
     def __init__(self, args, save_file = None):
         if args.dinput > 1:

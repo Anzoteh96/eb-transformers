@@ -4,11 +4,12 @@ import pickle
 import sys
 from collections import defaultdict
 from tqdm import tqdm
+import numpy as np
 
 import torch
 
 from eb_arena_mapper import TorchCpuUnpickler
-from algo_helpers import erm, npmle
+from algo_helpers import erm, fixed_grid_npmle
 
 
 def _get_key(x, m):
@@ -17,6 +18,8 @@ def _get_key(x, m):
 
 def freqpnlusm(x, m):
     # Round x to integers without modifying x in place
+    if isinstance(x, np.ndarray):
+        x = torch.from_numpy(x)
     x_rounded = torch.round(x).to(torch.int64)
     B, N, D = x_rounded.shape
     ret = torch.zeros(B, N, 1)
@@ -40,7 +43,7 @@ def freqnplus1(x):
     return freqpnlusm(x, 1)
 
 
-attributes = {"erm": erm, "freqn": freqn, "freqnplus1": freqnplus1}  # , "npmle": npmle}
+attributes = {"erm": erm, "freqn": freqn, "freqnplus1": freqnplus1}
 
 
 if __name__ == "__main__":
@@ -56,6 +59,8 @@ if __name__ == "__main__":
     if not os.path.exists(out_f):
         with open(args.input, "rb") as f:
             data = TorchCpuUnpickler(f).load()["x"]
+            if isinstance(data, np.ndarray):
+                data = torch.from_numpy(data)
             out = attribute(data)
             with open(
                 out_f,

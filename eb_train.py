@@ -14,215 +14,10 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import tqdm
+import torch.nn.functional as F
+from eb_transformer import EBTransformer
+from gen_priors import DirichletProcess, RandMultinomial, NeuralPrior
 
-from gen_priors import DirichletProcess, Multinomial, NeuralPrior, RandMultinomial
-
-
-class EBTransformer(torch.nn.Module):
-    def __init__(self, args):
-        super().__init__()
-        self.args = args
-        factory_kwargs = {"device": args.device, "dtype": args.dtype}
-        # We augment each input with constant 1 dimension. Otherwise, for dinput=1
-        # layernorm completely kills the
-        self.embed = torch.nn.Linear(args.dinput + 1, args.dmodel, **factory_kwargs)
-        # Standard transformers have layernorms without weight sharing.
-        # So we want to incorporate that while making sure that previous transformers (layernorms w weight sharing) still works well.
-        if args.norm_share:
-            self.norm = torch.nn.LayerNorm(args.dmodel, **factory_kwargs)
-            self.norm2 = torch.nn.LayerNorm(args.dmodel, **factory_kwargs)
-        else:
-            num_norms = args.weight_share if args.weight_share > 0 else args.layers
-            self.norm = torch.nn.ModuleList(
-                [
-                    torch.nn.LayerNorm(args.dmodel, **factory_kwargs)
-                    for _ in range(num_norms)
-                ]
-            )
-            self.norm2 = torch.nn.ModuleList(
-                [
-                    torch.nn.LayerNorm(args.dmodel, **factory_kwargs)
-                    for _ in range(num_norms)
-                ]
-            )
-
-        # Separating between weight sharing and no weight sharing.
-        # If weight sharing is N > 0, then we have N of the different weights.
-        if args.weight_share > 0:
-            self.linear1 = torch.nn.ModuleList(
-                [
-                    torch.nn.Linear(args.dmodel, 4 * args.dmodel, **factory_kwargs)
-                    for _ in range(args.weight_share)
-                ]
-            )
-            # self.dropout = torch.nn.Dropout(args.dropout);
-            self.linear2 = torch.nn.ModuleList(
-                [
-                    torch.nn.Linear(4 * args.dmodel, args.dmodel, **factory_kwargs)
-                    for _ in range(args.weight_share)
-                ]
-            )
-        else:
-            self.linear1 = torch.nn.ModuleList(
-                [
-                    torch.nn.Linear(args.dmodel, 4 * args.dmodel, **factory_kwargs)
-                    for _ in range(args.layers)
-                ]
-            )
-            # self.dropout = torch.nn.Dropout(args.dropout);
-            self.linear2 = torch.nn.ModuleList(
-                [
-                    torch.nn.Linear(4 * args.dmodel, args.dmodel, **factory_kwargs)
-                    for _ in range(args.layers)
-                ]
-            )
-
-        self.activation = (
-            torch.nn.modules.GELU()
-            if args.activation == "gelu"
-            else torch.nn.modules.ReLU()
-        )
-        # Here we distinguish between weight sharing or no.
-        if args.weight_share > 0:
-            self.self_attn = torch.nn.ModuleList(
-                [
-                    torch.nn.MultiheadAttention(
-                        args.dmodel,
-                        args.heads,  # dropout=args.dropout,
-                        batch_first=True,
-                        **factory_kwargs,
-                    )
-                    for _ in range(args.weight_share)
-                ]
-            )
-        else:
-            self.self_attn = torch.nn.ModuleList(
-                [
-                    torch.nn.MultiheadAttention(
-                        args.dmodel,
-                        args.heads,  # dropout=args.dropout,
-                        batch_first=True,
-                        **factory_kwargs,
-                    )
-                    for _ in range(args.layers)
-                ]
-            )
-
-        # Enable causal processing
-        if False:
-            tmp = torch.full((args.seqlen, args.seqlen), 1, dtype=torch.uint8)
-            self.mask = torch.triu(tmp, diagonal=1).to(
-                args.device
-            )  # replace diagonal and below with zeros
-        else:
-            self.mask = None
-
-        if args.decoding_layer_norm:
-            self.norm3 = torch.nn.LayerNorm(args.dmodel, **factory_kwargs)
-
-        self.decoder = torch.nn.Linear(args.dmodel, args.dinput, **factory_kwargs)
-        return None
-
-    def forward(self, inputs):
-        # Add dummy dimension to help avoid killing input's magnitude by the LayerNorm.
-        # inputs is BxTxd_in. inputs_aux is BxTx(d_in+1).
-        ones = torch.ones(inputs.shape[0], inputs.shape[1], 1).to(self.args.device)
-        inputs_aux = torch.cat([inputs, ones], dim=2)
-        emb = self.embed(inputs_aux)
-        for i in range(self.args.layers):
-            idx = (
-                int(i * self.args.weight_share // self.args.layers)
-                if self.args.weight_share > 0
-                else i
-            )
-            if self.args.norm_share:
-                tmp = self.norm(emb)
-            else:
-                tmp = self.norm[idx](emb)
-            tmp, _ = self.self_attn[idx](
-                tmp, tmp, tmp, attn_mask=self.mask, need_weights=False
-            )
-
-            # tmp = self.dropout(tmp);
-            ## WARNING: do not use emb += .... since that op is inplace
-            emb = emb + tmp * self.args.step
-            # Implement FF module
-            if self.args.norm_share:
-                tmp = self.norm2(emb)
-            else:
-                tmp = self.norm2[idx](emb)
-            tmp_ff1 = self.linear1[idx](tmp)
-            tmp_ff2 = self.activation(tmp_ff1)
-            tmp_ff3 = self.linear2[idx](tmp_ff2)
-            emb = emb + tmp_ff3 * self.args.step
-
-        if self.args.decoding_layer_norm:
-            emb = self.norm3(emb)
-        out = self.decoder(emb)
-        # To ensure that we only prediction nonnegative values, we add a final relu step.
-        # ReLU can turn bad if your network start with all negative values (or get into that at one point),
-        # let's try GELU instead.
-        gelu = torch.nn.GELU()
-        out = gelu(out)
-        return out
-
-    def eval_loss(self, inputs, labels):
-        out = self.forward(inputs)
-        loss = ((out - labels) ** 2).sum() / inputs.numel()
-        return loss
-
-    def get_layer_activation(self, inputs, layer):
-        self.eval()
-        # Add dummy dimension to help avoid killing input's magnitude by the LayerNorm.
-        # inputs is BxTxd_in. inputs_aux is BxTx(d_in+1).
-        ones = torch.ones(inputs.shape[0], inputs.shape[1], 1).to(self.args.device)
-        inputs_aux = torch.cat([inputs, ones], dim=2)
-        emb = self.embed(inputs_aux)
-        activation = emb
-        mlp_step = None
-        attn_step = None
-        for i in range(self.args.layers):
-            if layer == 0:
-                break
-            idx = (
-                int(i * self.args.weight_share // self.args.layers)
-                if self.args.weight_share > 0
-                else i
-            )
-            if "norm_share" not in self.args or self.args.norm_share:
-                tmp = self.norm(emb)
-            else:
-                tmp = self.norm[idx](emb)
-            tmp, _ = self.self_attn[idx](
-                tmp, tmp, tmp, attn_mask=self.mask, need_weights=False
-            )
-
-            # tmp = self.dropout(tmp);
-            ## WARNING: do not use emb += .... since that op is inplace
-            emb = emb + tmp * self.args.step
-            attn_step = tmp * self.args.step
-            # Implement FF module
-            if "norm_share" not in self.args or self.args.norm_share:
-                tmp = self.norm2(emb)
-            else:
-                tmp = self.norm2[idx](emb)
-            tmp_ff1 = self.linear1[idx](tmp)
-            tmp_ff2 = self.activation(tmp_ff1)
-            tmp_ff3 = self.linear2[idx](tmp_ff2)
-            mlp_step = tmp_ff3 * self.args.step
-            emb = emb + tmp_ff3 * self.args.step
-            activation = emb
-            if i == layer - 1:
-                break
-        if self.args.decoding_layer_norm:
-            emb = self.norm3(emb)
-        out = self.decoder(emb)
-        return {
-            "activations": activation,
-            "mlp_step": mlp_step,
-            "attn_step": attn_step,
-            "out": out,
-        }
 
 
 # Helper function that calculates the number of parameters.
@@ -234,6 +29,24 @@ def get_n_params(model):
             nn = nn * s
         pp += nn
     return pp
+
+
+# import ipdb
+def plot_thetas(args):
+    print(f"Generating a few samples of the distributions of Thetas used")
+    fig, axs = plt.subplots(4, 4)
+    for ax in axs.flatten():
+        _, prior = get_batch(args, return_prior = True)
+        thetas = prior.gen_thetas(args).cpu()
+        ax.hist(thetas.flatten().numpy(), bins=500, density=True)
+        ax.set_ylim([0, 0.2])
+        ax.set_xlim([0, args.theta_max])
+    # ipdb.set_trace();
+
+    axs.flatten()[0].set_title(f"B = {args.batch}, S={args.seqlen}, dim={args.dinput}")
+    # plt.show();
+    fig.savefig(args.fname_prefix + "_thetas.png")
+    plt.close(fig)
 
 
 def get_batch(args, return_prior=False):
@@ -266,11 +79,10 @@ def get_batch(args, return_prior=False):
         # Two cases: prior_file is given (in which case we just use it),
         # or not given (then we use RandMultinomial)
         if args.prior_file is not None:
-            # Now read the file.
+            # Now read the file. 
             lst = np.load(args.prior_file)
-            atoms, probs = (
-                torch.from_numpy(lst["atoms"]).to(args.device),
-                torch.from_numpy(lst["probs"]).to(args.device),
+            atoms, probs = (torch.from_numpy(lst['atoms']).to(args.device), 
+                            torch.from_numpy(lst['probs']).to(args.device)
             )
             args.atoms = atoms
             args.probs = probs
@@ -323,6 +135,16 @@ def train(args, model=None):
     if model is None:
         model = EBTransformer(args)
         model.nr_steps = 0
+    
+    # Add a mechanism to temporarily store outputs every 300 (or so) epochs. 
+    if args.store_temp_model:
+        store_filename = args.fname_prefix + "_temp_model.pkl"
+        outdict = {
+            "args": args,
+        }
+    
+    num_params = get_n_params(model)
+    print("Number of parameters: {}".format(num_params))
 
     lr = args.train_lr
     ad_eps = 0.01
@@ -349,7 +171,7 @@ def train(args, model=None):
         # model.param_report();
 
         (inputs, labels) = get_batch(args)
-        loss = model.eval_loss(inputs, labels)
+        loss = model.eval_loss(inputs, labels, args.num_padding)
         optimizer.zero_grad()
         loss.backward()
         norm_type = 2
@@ -387,6 +209,13 @@ def train(args, model=None):
             if math.isnan(avg_grad_norm) or math.isnan(cur_loss) or cur_loss > max_loss:
                 print("... ABORTING THIS RUN ...")
                 return None
+            if args.store_temp_model:
+                print(f"Storing temporary model to {store_filename}")
+                with open(store_filename, "wb") as f:
+                    outdict.update({"model": model})
+                    outdict.update({"step": step})
+                    outdict.update({"loss_ratio": cur_loss/mle_loss})
+                    pickle.dump(outdict, f)
 
     # model.param_report();
 
@@ -459,6 +288,22 @@ if __name__ == "__main__":
         action="store_true",
         help="are we adding layer norm before decoding?",
     )
+    # Next, we customize and see if we want our attention's activation to be softmax or something else. 
+    parser.add_argument(
+        "--att_activ", type=str, default="softmax", help="custom activation for attention"
+    )
+    parser.add_argument(
+        "--attn_only", action="store_true", help = "Do we want MLP in between"
+    )
+
+    parser.add_argument(
+        "--no_prenorm", action="store_true", help = "Do we want pre-norm or not"
+    )
+
+    parser.add_argument(
+        "--no_postnorm", action="store_true", help = "Do we want post-norm or not"
+    )
+
     ### Training hyper params
     parser.add_argument(
         "--train_steps", type=int, default=100_000, help="Number of training steps"
@@ -483,9 +328,17 @@ if __name__ == "__main__":
         help="Do not generate a sample histogram of thetas",
     )
     parser.add_argument(
+        "--num_padding", type=int, default=0, help="number of padding dimension"
+    )
+    parser.add_argument(
         "--keep_stdout", action="store_true", help="Do not redirect to log file"
     )
     parser.add_argument("--tqdm_disable", action="store_true", help="disable tqdm")
+    parser.add_argument(
+        "--store_temp_model",
+        action="store_true",
+        help="Store temporary model every N epochs",
+    )
     args = parser.parse_args()
     if torch.cuda.is_available():
         args.device = "cuda"
@@ -499,6 +352,8 @@ if __name__ == "__main__":
     salt = "".join(random.choices(string.ascii_letters + string.digits, k=3))
     fname_prefix = datetime.datetime.now().strftime("eb_%Y_%m_%d-%H_%M_" + salt)
     args.fname_prefix = fname_prefix
+    if args.nohist_thetas == False:
+        plot_thetas(args)
 
     if not args.keep_stdout:
         print(f"Using {fname_prefix}.log for stdout")
@@ -506,6 +361,14 @@ if __name__ == "__main__":
 
     start_time = time.time()
 
+    # torch.autograd.set_detect_anomaly(True);
+
+    if False:
+        # Testing dumping
+        model = EBTransformer(args)
+        outdict.update({"model": model})
+        with open("test.pkl", "wb") as f:
+            pickle.dump(outdict, f)
 
     if True:
         print("Using the following settings:\n", args)
@@ -513,6 +376,9 @@ if __name__ == "__main__":
         outdict.update(main_res)
         with open(fname_prefix + ".pkl", "wb") as f:
             pickle.dump(outdict, f)
+
+        # Insert here something that generates validation plots (e.g. on hockey data, vs NPMLE, Robbins etc)
+        # plot_pickle(fname_prefix + '.pkl');
 
         end_time = time.time()
         print(f"Total time: {(end_time - start_time) / 60:.1f} min")

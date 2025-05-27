@@ -7,9 +7,9 @@ import eb_train
 import os
 import numpy as np
 from tqdm import tqdm
-#from tabulate import tabulate
 import math
-from eb_train import EBTransformer, get_n_params
+from eb_transformer import EBTransformer
+from eb_train import get_n_params
 from gen_priors import NeuralPrior, DirichletProcess, WorstPrior
 import random
 from algo_helpers import robbins, erm_helper, erm, fixed_grid_npmle, eval_regfunc, npmle
@@ -46,9 +46,33 @@ def set_seed(seed: int = 42) -> None:
     os.environ["PYTHONHASHSEED"] = str(seed)
     print(f"Random seed set as {seed}")
 
+# Sanity check: make sure that the MLP can also overfit into one prior. 
+# To do so we regurgitate the input-output pair from the same prior. 
+def train_overfit(model, inputs, labels, num_epochs):
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.02, eps=0.01)
+    scheduler = torch.optim.lr_scheduler.StepLR(
+        optimizer, 1.0, gamma=0.9
+    )
+    for step in tqdm(range(num_epochs)):
+        # model.param_report();
+        loss = model.eval_loss(inputs, labels)
+        #if (step+1) % 100 == 0:
+        #    from IPython import embed; embed()
+        optimizer.zero_grad()
+        # print(loss)
+        loss.backward()
+        norm_type = 2
+        total_norm = torch.norm(
+            torch.stack(
+                [torch.norm(p.grad.detach(), norm_type) for p in model.parameters()]
+            ),
+            norm_type,
+        )
+        # total_grad_norm += total_norm
+        optimizer.step()
+    return model
+
 def gen_batch_from_seed(args, return_prior = False):
-    #np.random.seed(seed)
-    #torch.seed(seed)
     """
         Returns:
             inputs: integer labels of the observations. 
@@ -116,6 +140,14 @@ def get_batch_loss(model, args):
         outputs = eval_regfunc(atoms, probs, inputs.flatten()).reshape(inputs.shape)
         inference_time = None
     else:
+        if args.prior_fit:
+            import copy
+            model_start = copy.deepcopy(model)
+            b = args.batch
+            args.batch = 10 * b
+            (inputs_new, labels_new) = gen_batch_from_seed(args)
+            model = train_overfit(model, inputs_new, labels_new, 200)
+            args.batch = b
         with torch.inference_mode():
             # There are two different ways of measuring time: CUDA vs CPU. 
             # For CUDA, we'll make sure that CUDA synchronizes. 
@@ -135,6 +167,9 @@ def get_batch_loss(model, args):
                outputs = model(inputs)
                end = time.perf_counter()
                inference_time = end - start
+        if args.prior_fit:
+            #import copy
+            model = copy.deepcopy(model_start)
 
     if args.save_random_input:
         out_name = f"{args.dbg_file}/{args.mdl_name}{args.start}{args.end}"
@@ -142,7 +177,7 @@ def get_batch_loss(model, args):
             pickle.dump((inputs, labels), f)
     cur_mse = torch.mean((outputs - labels) ** 2)
     normalized_mse = cur_mse / labels_var
-    return cur_mse, normalized_mse, inference_time #outputs.detach().cpu().numpy(), labels.cpu().numpy()
+    return cur_mse, normalized_mse, inference_time 
 
 def get_mses(model, args, seed):
     set_seed(seed)
@@ -150,8 +185,6 @@ def get_mses(model, args, seed):
     mses = np.zeros(args.end- args.start)
     norm_mses = np.zeros(args.end- args.start) # MSEs normalized by the variances of labels. 
     inference_times = np.zeros(args.end- args.start)
-    #batch_outs =  (args.end- args.start) * [0]
-    #batch_labels = (args.end- args.start) * [0]
     #TODO: vectorize?
     for i, data_seed in  enumerate(data_seeds):
         args.seed = data_seed
@@ -168,9 +201,9 @@ def main():
     parser.add_argument('--seed', type = int, help='seed used to generate inputs')
     parser.add_argument('--start', type = int, help='first input this job is responsible for')
     parser.add_argument('--end', type = int, help='last input this job is responsible for')
-    parser.add_argument('--llmap_out', help='output dir')
-    parser.add_argument('--save_random_input', type=bool, default=False, help='')
-    parser.add_argument('--same_prior', type=bool, default=False, help='')
+    parser.add_argument('--llmap_out', help='output dir passed by LLMapReduce')
+    parser.add_argument('--save_random_input', type=bool, default=False, help='output dir passed by LLMapReduce')
+    parser.add_argument('--same_prior', type=bool, default=False, help='output dir passed by LLMapReduce')
     parser.add_argument('--prior_seed', type=int, default=10)
     
     parser.add_argument('--dbg_file', help='path to debug stuff')
@@ -183,12 +216,14 @@ def main():
     parser.add_argument('--alpha', type=float, default=None, help='alpha param for dirichlet')
     parser.add_argument('--dirich_prob', type=float, default=None, help = 'Dirichlet mixture probability')
     parser.add_argument('--uniform_percentage', type=float, default=0.0, help='percentage that')
+    parser.add_argument('--prior_fit', action='store_true', help='do we want to overfit to a prior?')
     
     parser.add_argument('--dmodel', type=int, default=32, help='dimensionality of each token')
     parser.add_argument('--dinput', type=int, default=1, help='dimensionality of inputs and labels')
     parser.add_argument('--batch', type=int, default=192, help='number of batches')
     parser.add_argument('--theta_max', type=float, default=50, help='limit on the support of the prior')
     # Let's also add randomness for thetamax. 
+    # In practice this is not used, since we usually evaluate it on priors with fixed thetamax. 
     parser.add_argument('--theta_max_israndom', action="store_true", help = "are thetamax random?")
     parser.add_argument('--seqlen', type=int, default=512, help='maximal length of the input')
     parser.add_argument('--uniform_prior', action='store_true', help='Simplistic generation where thetas are sampled from a uniform prior')
@@ -221,15 +256,17 @@ def main():
     if model in benchmarks:
         mdl_name =  model
         model = benchmarks[model]
-        model_args = None # We should really store the model arguments into the pickle file to eliminate all the headaches arising later on. 
+        model_args = None 
     else:
         mdl_name =  model.split("/")[-1]
         model = load_model_dict(model, args.device)['model']
+        model_args = None
         if args.device == 'cuda':
             model = model.cuda()
-        model.args.device = args.device
-        model_args = model.args
-        model_args.num_params = get_n_params(model)
+        if isinstance(model, EBTransformer):
+            model.args.device = args.device
+            model_args = model.args
+            model_args.num_params = get_n_params(model)
 
     mses, norm_mses, runtime = get_mses(model, args, args.seed)
     output = {"mses" : mses, "norm_mses": norm_mses, "time": runtime, "mdl_name": mdl_name, 
@@ -238,10 +275,6 @@ def main():
     print("I am outputting here", out_name)
     with open(out_name, "wb") as f:
         pickle.dump(output, f)
-
-
-    
-
     
 
 if __name__ == '__main__':

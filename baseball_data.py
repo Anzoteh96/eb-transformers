@@ -8,7 +8,7 @@ from tqdm import tqdm
 import pickle
 import math
 import time
-from eb_train import EBTransformer
+from eb_transformer import EBTransformer
 from eb_arena_mapper import load_model_dict
 from algo_helpers import robbins, erm, npmle, fixed_grid_npmle
 
@@ -53,15 +53,32 @@ def baseball_data(file1, file2):
 
     return gpast.values, gfut.values
 
+# Can we also concatenate a few past "fit" values together? 
+def prev_fit_data(target_year, num_fit, position, train_ratio):
+    dataset_dir = 'datasets/baseball'
+    inputs_all = []
+    labels_all = []
+    file_prefix = "batting" if position == "bat" else "pitching"
+    for i in range(1, num_fit + 1):
+        prev_year = target_year - i
+        season_file = os.path.join(dataset_dir, '{}_hitcount_{}.csv'.format(file_prefix, prev_year))
+        print(season_file)
+        inputs, labels = get_baseball_dataset(season_file, train_ratio)
+        inputs_all.append(inputs)
+        labels_all.append(labels)
+    inputs_all = np.concatenate(inputs_all)
+    labels_all = np.concatenate(labels_all)
+
+    return inputs_all, labels_all
+
 def main():
     print(sys.argv)
     parser = argparse.ArgumentParser(description='eb_arena')
     parser.add_argument('--model', help='name of model to use')
-    parser.add_argument('--llmap_out', help='output dir passed by')
-    #parser.add_argument('--dbg_file', help='path to debug stuff')
     parser.add_argument('--pos', default=None) # default: either bat or pitch. 
     parser.add_argument('--data_dir', help='path we want to extract our data from')
     parser.add_argument('--year', help='year of interest')
+    parser.add_argument('--out_dir', help='directory where we output our predictions')
 
     args = parser.parse_args()
     args.mdl_name = args.model
@@ -94,16 +111,20 @@ def main():
         model = benchmarks[model]
         model_args = None
     else:
+        model_args = None
         mdl_name =  model.split("/")[-1]
         model = load_model_dict(model, args.device)['model']
-        model.args.device = args.device
-        model_args = model.args
+        if args.device == 'cuda':
+            model = model.cuda()
+        if isinstance(model, EBTransformer): 
+            model.args.device = args.device
+            model_args = model.args
 
     # Now try to get the baseball data. 
     if args.pos == "bat":
-        train_ratio = 0.20
+        train_ratio = 0.50 # Old: 1/5
     elif args.pos == "pitch":
-        train_ratio = 1/6
+        train_ratio = 0.50 # Old: 1/6
     inputs, labels = get_baseball_dataset(args.season_file, train_ratio)
     inputs = torch.from_numpy(inputs[np.newaxis, :, np.newaxis]).to(args.device).float()
     labels = torch.from_numpy(labels[np.newaxis, :, np.newaxis]).to(args.device).float()
@@ -119,10 +140,10 @@ def main():
     # Finally dump the output? 
     output = {"args": model_args, "input": inputs.detach().cpu().numpy(), "label": labels.detach().cpu().numpy(), 
               "output": outputs.detach().cpu().numpy(), "time": inference_time}
-    out_name = f"baseball_results_v2/{mdl_name}_{args.pos}_{args.year}.pkl"
+    out_name = f"{args.out_dir}/{mdl_name}_{args.pos}_{args.year}.pkl"
+    os.makedirs(args.out_dir, exist_ok=True)
     print(mse.item())
     print(out_name)
-    os.makedirs("baseball_results_v2" , exist_ok = True)
     with open(out_name, "wb") as f:
         pickle.dump(output, f)
 

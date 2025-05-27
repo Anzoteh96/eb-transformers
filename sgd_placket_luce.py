@@ -1,20 +1,19 @@
 from collections import defaultdict
 from itertools import chain
-
+from tqdm import tqdm
 import torch
 import torch.optim.lr_scheduler as lr_scheduler
-
-
-def get_log_outcome_probability(weights, argsort_out):
+#NOTE: RANKING HERE IS NOT REALLY REALLY RANKING, IT'S ARGSORT
+def get_log_outcome_probability(weights, ranking):
     exp_weights = torch.exp(weights)
-    ranked_exp_weights = exp_weights[argsort_out]
+    ranked_exp_weights = exp_weights[ranking]
     cumsum = torch.cumsum(ranked_exp_weights, dim=1)
     rev_cumsum = (
         torch.sum(ranked_exp_weights, dim=1)[:, None] - cumsum + ranked_exp_weights
     )
     log_probs = torch.log(rev_cumsum + 1e-6)
-    return torch.sum(weights) - torch.sum(log_probs, dim=1)
-
+    return torch.sum(weights) - torch.sum(log_probs, dim =1)
+     
 
 def sgd_placket_luce(
     argsort_out, lr=1e-1, thresh=1e-6, max_iter=100, c=0.01, debug=True, debug_out=""
@@ -22,18 +21,19 @@ def sgd_placket_luce(
     weights = torch.randn(
         argsort_out.shape[1], requires_grad=True
     )  # might want to look into other initialization methods
-    print(weights)
+    # print(weights)
     optimizer = torch.optim.Adam([weights], lr=lr)
     optimizer.zero_grad()
     scheduler = lr_scheduler.LinearLR(
         optimizer, start_factor=0.5, end_factor=1e-3, total_iters=max_iter
     )
-    for i in range(1, int(max_iter)):
+    for i in tqdm(range(1, int(max_iter))):
         if weights.grad is not None:
             if torch.norm(weights.grad) < thresh:
                 break
             if i % 100 == 0 or i < 10:
-                print(torch.norm(weights.grad))
+                pass
+                # print(torch.norm(weights.grad))
         else:
             if i % 100 == 0 or i < 10:
                 print(i, " bad iteration")

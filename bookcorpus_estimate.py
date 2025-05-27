@@ -16,9 +16,11 @@ def main():
     print(sys.argv)
     parser = argparse.ArgumentParser(description='bookcorpus')
     parser.add_argument('--model', help='name of model to use')
+    parser.add_argument('--dataset_dir', help='directory of dataset')
     parser.add_argument('--filename', help = 'name of file to do')
-    parser.add_argument('--tokenizer', help = 'name of file to do')
-
+    parser.add_argument('--tokenizer', help = 'tokenizer')
+    parser.add_argument('--out_dir', help='where to store those outputs')
+    
     args = parser.parse_args()
     assert args.tokenizer in ['countvec', 'tiktoken']
 
@@ -31,9 +33,9 @@ def main():
 
     benchmarks = {}
 
-    benchmarks['mle'] = lambda x : x 
+    benchmarks['mle'] = lambda x : x
     benchmarks['robbins'] = robbins
-    benchmarks["erm"] = erm 
+    benchmarks["erm"] = erm
     benchmarks["npmle"] = npmle
     benchmarks["fixed_grid_npmle"] = fixed_grid_npmle
     benchmarks["worst_prior"] = "worst_prior" # Okay maybe this is not too too well-defined in the other file. Will be a TODO. 
@@ -50,9 +52,8 @@ def main():
         model.args.device = args.device
         model_args = model.args
 
-    dir_name = "bookcorpusopen/dataframes_{}".format(args.tokenizer)
     file_root = args.filename.split(".")[0]
-    full_filename = os.path.join(dir_name, args.filename + ".csv")
+    full_filename = os.path.join(args.dataset_dir, args.filename + ".csv")
     df = pd.read_csv(full_filename)
     inputs = df['Frequency_x'].values
     labels = df['Frequency_y'].values
@@ -70,10 +71,10 @@ def main():
 
     mse = torch.mean((outputs - labels) ** 2)
 
-    output = {"args": model_args, "input": inputs.detach().cpu().numpy(), "label": labels.detach().cpu().numpy(),
+    output = {"args": model_args, "input": inputs.detach().cpu().numpy(), "label": labels.detach().cpu().numpy(), 
               "output": outputs.detach().cpu().numpy(), "time": inference_time}
     # Let's do dir / model, lol. 
-    out_dir = f"bookcorpusopen_results_{args.tokenizer}/{args.filename}"
+    out_dir = args.out_dir
     if not os.path.exists(out_dir):
         os.makedirs(out_dir)
     out_name = os.path.join(out_dir, f"{mdl_name}.pkl")
@@ -84,4 +85,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
