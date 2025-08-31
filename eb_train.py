@@ -16,7 +16,7 @@ import torch
 import tqdm
 import torch.nn.functional as F
 from eb_transformer import EBTransformer
-from gen_priors import DirichletProcess, RandMultinomial, NeuralPrior
+from gen_priors import DirichletProcess, Multinomial, RandMultinomial, NeuralPrior
 
 
 
