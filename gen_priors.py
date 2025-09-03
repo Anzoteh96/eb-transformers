@@ -1,3 +1,5 @@
+import math
+from numbers import Real
 import numpy as np
 import torch
 import argparse
@@ -168,6 +170,60 @@ class Multinomial():
         lambdas = self.probs
         bayes_est = eval_regfunc(mu, lambdas, inputs.flatten()).reshape(inputs.shape)
         return bayes_est 
+    
+class GoofyPrior():
+    def __init__(self, A = 10, C=10, DIM=20, device = "cpu", dtype=torch.float32):
+        # Allow passing an argparse.Namespace by mistake then unwrap safely.
+        if isinstance(A, argparse.Namespace):
+            A = getattr(A, "A", A)
+        if isinstance(C, argparse.Namespace):
+            C = getattr(C, "C", C)
+        if isinstance(DIM, argparse.Namespace):
+            DIM = getattr(DIM, "DIM", DIM)
+
+        for name, val in [("A", A), ("C", C), ("DIM", DIM)]:
+            if not isinstance(val, Real):
+                raise TypeError(f"{name} must be numeric, got {type(val).__name__}")
+
+        self.A = float(A)
+        self.C = float(C)
+        self.DIM = int(DIM)
+        self.device = device
+        self.dtype = dtype
+    
+    def generate_support(self):
+        m = int(self.C * math.log(self.DIM))
+        return np.random.uniform(0, self.A, m)
+    
+    def generate_weights(self, m):
+        return np.random.dirichlet(np.ones(m))
+
+    def gen_thetas(self, seed=None):
+        m = int(self.C * math.log(self.DIM))
+        support = self.generate_support()
+        weights = self.generate_weights(m)
+        # compute the scalar sum_j w_j * support_j and replicate across DIM
+        scalar = float(np.dot(weights, support))
+        true_parameters = np.full(self.DIM, scalar, dtype=float)
+        # Return as torch tensor, matching expected shape
+        return torch.tensor(true_parameters, dtype=self.dtype).reshape(1, self.DIM, 1).to(self.device)
+
+    def generate_observations(self, true_parameters):
+        observations = np.zeros(self.DIM)
+        for i in range(self.DIM):
+            observations[i] = np.random.poisson(true_parameters[i])
+        return observations
+    
+    def sample_batch(self, batch_size=1):
+        m = int(self.C * math.log(self.DIM))
+        support = self.generate_support()
+        weights = self.generate_weights(m)
+        true_parameters = self.generate_true_parameters(weights, support)
+        observations = self.generate_observations(true_parameters)
+        inputs = torch.tensor(observations, dtype=self.dtype).reshape(1, self.DIM, 1).repeat(batch_size, 1, 1).to(self.device)
+        labels = torch.tensor(true_parameters, dtype=self.dtype).reshape(1, self.DIM, 1).repeat(batch_size, 1, 1).to(self.device)
+        return inputs, labels
+
 
 # Below is Prior on prior for multinomials, where the atoms are fixed but the probability follows dirichlet distribution. 
 class RandMultinomial(Multinomial):

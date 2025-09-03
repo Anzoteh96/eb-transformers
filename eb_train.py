@@ -16,9 +16,11 @@ import torch
 import tqdm
 import torch.nn.functional as F
 from eb_transformer import EBTransformer
-from gen_priors import DirichletProcess, Multinomial, RandMultinomial, NeuralPrior
-
-
+from gen_priors import DirichletProcess, GoofyPrior, Multinomial, RandMultinomial, NeuralPrior
+#Constants for GoofyPrior
+DEFAULT_A = 10.0
+DEFAULT_C = 10
+DEFAULT_DIM = 20
 
 # Helper function that calculates the number of parameters.
 def get_n_params(model):
@@ -68,6 +70,16 @@ def get_batch(args, return_prior=False):
     # How do we get priors?
     if args.prior == "neural":
         prior = NeuralPrior(args)
+        thetas = prior.gen_thetas()
+
+    elif args.prior == "goofy":
+        prior = GoofyPrior(
+            A=DEFAULT_A,
+            C=DEFAULT_C,
+            DIM=DEFAULT_DIM,
+            device=args.device,
+            dtype=torch.float32,
+        )
         thetas = prior.gen_thetas()
 
     elif args.prior == "dirichlet":
