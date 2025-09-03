@@ -185,16 +185,20 @@ class GoofyPrior():
             if not isinstance(val, Real):
                 raise TypeError(f"{name} must be numeric, got {type(val).__name__}")
 
+        # A should be theta_max, DIM should be seqlen
+        # For our early experiments, I suggest to pass C * log DIM as a single argument m
         self.A = float(A)
         self.C = float(C)
         self.DIM = int(DIM)
         self.device = device
         self.dtype = dtype
-    
+
+    # For consistency, use torch to generate random samples rather than numpy 
     def generate_support(self):
         m = int(self.C * math.log(self.DIM))
         return np.random.uniform(0, self.A, m)
-    
+
+    # Same for dirichlet
     def generate_weights(self, m):
         return np.random.dirichlet(np.ones(m))
 
@@ -208,6 +212,7 @@ class GoofyPrior():
         # Return as torch tensor, matching expected shape
         return torch.tensor(true_parameters, dtype=self.dtype).reshape(1, self.DIM, 1).to(self.device)
 
+    # I don't think this is needed? 
     def generate_observations(self, true_parameters):
         observations = np.zeros(self.DIM)
         for i in range(self.DIM):
