@@ -265,6 +265,7 @@ if __name__ == "__main__":
         default="batch",
         help="how should the mixture be dealt with",
     )
+    parser.add_argument("--m", type=int, default=20, help="m parameter in goofy prior")
     # Let's also add randomness for thetamax.
     parser.add_argument(
         "--theta_max_israndom", action="store_true", help="are thetamax random?"

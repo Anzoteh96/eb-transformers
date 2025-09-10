@@ -178,8 +178,8 @@ class GoofyPrior():
         self.A = args.theta_max
         self.DIM = args.seqlen
         self.m = args.m
-        self.device = device
-        self.n = args.n
+        self.device = args.device
+        self.dtype = args.dtype
     # For consistency, use torch to generate random samples rather than numpy 
     def generate_support(self):
         return torch.rand(self.m, device = self.device, dtype = self.dtype) * self.A # torch.rand generates [0, 1) so we scale it.
@@ -194,13 +194,13 @@ class GoofyPrior():
         weights = self.generate_weights()
 
         # Sample n indices according to weights
-        indices = torch.multinomial(weights, self.n, replacement=True) #apparently multinomial is more efficient
+        indices = torch.multinomial(weights, self.DIM, replacement=True) #apparently multinomial is more efficient
 
         # Select atoms for each theta
         thetas = support[indices]
 
         # Return as torch tensor, matching expected shape
-        return thetas.reshape(1, self.n, 1).to(self.device)
+        return thetas.reshape(1, self.DIM, 1).to(self.device)
 
 
 # Below is Prior on prior for multinomials, where the atoms are fixed but the probability follows dirichlet distribution. 
