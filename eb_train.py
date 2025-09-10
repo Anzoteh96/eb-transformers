@@ -17,10 +17,6 @@ import tqdm
 import torch.nn.functional as F
 from eb_transformer import EBTransformer
 from gen_priors import DirichletProcess, GoofyPrior, Multinomial, RandMultinomial, NeuralPrior
-#Constants for GoofyPrior
-DEFAULT_A = 10.0
-DEFAULT_C = 10
-DEFAULT_DIM = 20
 
 # Helper function that calculates the number of parameters.
 def get_n_params(model):
@@ -39,7 +35,7 @@ def plot_thetas(args):
     fig, axs = plt.subplots(4, 4)
     for ax in axs.flatten():
         _, prior = get_batch(args, return_prior = True)
-        thetas = prior.gen_thetas(args).cpu()
+        thetas = prior.gen_thetas().cpu() # Typerror: NeuralPrior.gen_thetas() takes 1 positional argument but 2 were given. I don't think we need to pass args through gen.thetas...?
         ax.hist(thetas.flatten().numpy(), bins=500, density=True)
         ax.set_ylim([0, 0.2])
         ax.set_xlim([0, args.theta_max])
@@ -73,13 +69,7 @@ def get_batch(args, return_prior=False):
         thetas = prior.gen_thetas()
 
     elif args.prior == "goofy":
-        prior = GoofyPrior(
-            A=DEFAULT_A,
-            C=DEFAULT_C,
-            DIM=DEFAULT_DIM,
-            device=args.device,
-            dtype=torch.float32,
-        )
+        prior = GoofyPrior(args)
         thetas = prior.gen_thetas()
 
     elif args.prior == "dirichlet":
@@ -102,7 +92,7 @@ def get_batch(args, return_prior=False):
         else:
             prior = RandMultinomial(args)
         thetas = prior.gen_thetas()
-
+    # Maybe we want to add support for our goofyprior?
     elif args.prior == "mixture":
         # Here we only support Dirichlet and neural mixture, for now.
         assert args.dirich_prob is not None, (
@@ -365,7 +355,7 @@ if __name__ == "__main__":
     fname_prefix = datetime.datetime.now().strftime("eb_%Y_%m_%d-%H_%M_" + salt)
     args.fname_prefix = fname_prefix
     if args.nohist_thetas == False:
-        plot_thetas(args)
+        plot_thetas(args) # Similar issue here, I don't think we need to pass args through gen.thetas...? Nvm we do!
 
     if not args.keep_stdout:
         print(f"Using {fname_prefix}.log for stdout")
