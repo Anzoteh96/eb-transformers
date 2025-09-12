@@ -1,10 +1,10 @@
 import torch
-DIM = 512 # n or seqlen
+DIM = 512
 A = 50
 m = [5,10,20,40,80] # possible values of m 
 
-x = torch.rand(10) * A # support
-y =torch.distributions.Dirichlet(torch.ones(10),).sample() # weights
+x = torch.rand(80) * A # support
+y =torch.distributions.Dirichlet(torch.ones(80),).sample() # weights
 
 print(x)
 print(y)

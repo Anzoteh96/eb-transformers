@@ -1,5 +1,5 @@
 import torch
-DIM = 512 # n or seqlen
+DIM = 512
 A = 50
 m = [5,10,20,40,80] # possible values of m 
 

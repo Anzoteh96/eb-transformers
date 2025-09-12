@@ -62,11 +62,6 @@ def train_overfit(model, inputs, labels, num_epochs):
         optimizer.zero_grad()
         # print(loss)
         loss.backward()
-        # Print per-layer gradient norms for vanishing gradient diagnosis
-        for name, param in model.named_parameters():
-            if param.grad is not None:
-                grad_norm = param.grad.norm().item()
-                print(f"Layer: {name}, Grad norm: {grad_norm}")
         norm_type = 2
         total_norm = torch.norm(
             torch.stack(

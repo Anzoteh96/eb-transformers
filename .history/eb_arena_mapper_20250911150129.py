@@ -62,11 +62,6 @@ def train_overfit(model, inputs, labels, num_epochs):
         optimizer.zero_grad()
         # print(loss)
         loss.backward()
-        # Print per-layer gradient norms for vanishing gradient diagnosis
-        for name, param in model.named_parameters():
-            if param.grad is not None:
-                grad_norm = param.grad.norm().item()
-                print(f"Layer: {name}, Grad norm: {grad_norm}")
         norm_type = 2
         total_norm = torch.norm(
             torch.stack(
@@ -222,9 +217,10 @@ def main():
     parser.add_argument('--save_random_input', type=bool, default=False, help='output dir passed by LLMapReduce')
     parser.add_argument('--same_prior', type=bool, default=False, help='output dir passed by LLMapReduce')
     parser.add_argument('--prior_seed', type=int, default=10)
+    parser.add_argument('--m', type=int, default=80, help='Number of atoms for GoofyPrior')
 
-    parser.add_argument('--m', type=int, default=None, # Added m here so I can test ID regret.
-                   help='clogDIM / histogram bins used by the data generator / tokenizer')
+    #parser.add_argument('--m', type=int, default=None, # Added m here so I can test ID regret.
+    #               help='clogDIM / histogram bins used by the data generator / tokenizer')
     
     parser.add_argument('--dbg_file', help='path to debug stuff')
     
@@ -237,6 +233,8 @@ def main():
     parser.add_argument('--dirich_prob', type=float, default=None, help = 'Dirichlet mixture probability')
     parser.add_argument('--uniform_percentage', type=float, default=0.0, help='percentage that')
     parser.add_argument('--prior_fit', action='store_true', help='do we want to overfit to a prior?')
+    parser.add_argument('--m', type=int, default=80, help='Number of atoms for GoofyPrior')
+
     
     parser.add_argument('--dmodel', type=int, default=32, help='dimensionality of each token')
     parser.add_argument('--dinput', type=int, default=1, help='dimensionality of inputs and labels')
