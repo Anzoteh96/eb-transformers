@@ -149,14 +149,23 @@ def train(args, model=None):
     print("Number of parameters: {}".format(num_params))
 
     lr = args.train_lr
-    ad_eps = 0.01
+    ad_eps = args.adam_eps
     print(
         f"EB trans: Using Adam, initial rate={lr:.3g}, eps = {ad_eps:.3g}, interval={args.train_lr_epoch}, gamma={args.train_lr_gamma}"
     )
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, eps=ad_eps)
-    scheduler = torch.optim.lr_scheduler.StepLR(
-        optimizer, 1.0, gamma=args.train_lr_gamma
-    )
+    # Learning-rate warmup + step decay via LambdaLR
+    def lr_lambda(step_idx):
+        warm = max(0, int(args.warmup_steps))
+        if step_idx < warm:
+            return (step_idx + 1) / max(1, warm)
+        # how many completed intervals after warmup
+        if args.train_lr_epoch > 0:
+            intervals = (step_idx - warm) // args.train_lr_epoch
+        else:
+            intervals = 0
+        return args.train_lr_gamma ** intervals
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
     real_start_time = time.time()
     start_time = time.time()
 
@@ -176,6 +185,15 @@ def train(args, model=None):
         loss = model.eval_loss(inputs, labels, args.num_padding)
         optimizer.zero_grad()
         loss.backward()
+        # Optional gradient clipping
+        if args.grad_clip > 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+        # Print per-layer gradient norms for vanishing gradient diagnosis
+        if args.log_grads:
+            for name, param in model.named_parameters():
+                if param.grad is not None:
+                    grad_norm = param.grad.norm().item()
+                    print(f"Layer: {name}, Grad norm: {grad_norm}")
         norm_type = 2
         total_norm = torch.norm(
             torch.stack(
@@ -188,8 +206,8 @@ def train(args, model=None):
 
         total_loss += loss.item()
         total_mle_loss += ((inputs - labels) ** 2).sum() / inputs.numel()
-        if step % args.train_lr_epoch == 0 and step > 0:
-            scheduler.step()
+        # Step scheduler every iteration (LambdaLR handles warmup + step decay)
+        scheduler.step()
 
         if step % log_interval == 0 and step > 0:
             lr = scheduler.get_last_lr()[0]
@@ -315,10 +333,19 @@ if __name__ == "__main__":
         "--train_lr", type=float, default=0.007, help="Initial learning rate"
     )
     parser.add_argument(
+        "--warmup_steps", type=int, default=400, help="Linear LR warmup steps"
+    )
+    parser.add_argument(
         "--train_lr_epoch", type=int, default=400, help="Step down rate period"
     )
     parser.add_argument(
         "--train_lr_gamma", type=float, default=0.95, help="Step down multiplier"
+    )
+    parser.add_argument(
+        "--adam_eps", type=float, default=1e-8, help="Adam epsilon"
+    )
+    parser.add_argument(
+        "--grad_clip", type=float, default=0.0, help="Clip grad global norm (>0 to enable)"
     )
     parser.add_argument(
         "--uniform_prior",
@@ -335,6 +362,9 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--keep_stdout", action="store_true", help="Do not redirect to log file"
+    )
+    parser.add_argument(
+        "--log_grads", action="store_true", help="Log per-parameter gradient norms each step"
     )
     parser.add_argument("--tqdm_disable", action="store_true", help="disable tqdm")
     parser.add_argument(
