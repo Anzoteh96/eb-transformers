@@ -1,7 +1,7 @@
 import pickle
 import matplotlib.pyplot as plt
 
-with open('/Users/nicolascannella/Repos/eb-transformers/mse_outeb_2025_09_18-21_43_04v.pkl_0_2__0.0', 'rb') as f:
+with open('/Users/nicolascannella/Repos/eb-transformers/mse_outeb_2025_09_18-21_43_qjs.pkl_0_2__0.0', 'rb') as f:
     data = pickle.load(f)
 
 print("Keys in output:", data.keys())
