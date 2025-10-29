@@ -8,10 +8,13 @@ from tqdm import tqdm
 import pickle
 import math
 from eb_transformer import EBTransformer
+from tabpfn import TabPFNRegressor 
 import time
 from eb_arena_mapper import load_model_dict
 from algo_helpers import robbins, erm, npmle, fixed_grid_npmle
+from mlp import MLP
 
+os.environ['TABPFN_ALLOW_CPU_LARGE_DATASET'] = '1'
 
 # Helper function in reading hockey data.
 def read_hock_position(filename,position = None):
@@ -90,6 +93,7 @@ def main():
     parser.add_argument('--llmap_out', help='output dir passed by LLMapReduce')
     parser.add_argument('--dbg_file', help='path to debug stuff')
     parser.add_argument('--pos', default=None)
+    parser.add_argument('--num_fit', type = int, default=0)
     parser.add_argument('--data_dir', help='path we want to extract our data from')
     parser.add_argument('--prev_year', type = int, help='year we have the samples')
     parser.add_argument('--next_year', type = int, help='year we want to predict')
@@ -114,12 +118,19 @@ def main():
     benchmarks["fixed_grid_npmle"] = fixed_grid_npmle
     benchmarks["worst_prior"] = "worst_prior" # Okay maybe this is not too too well-defined in the other file. Will be a TODO. 
 
+    # We first get some "(input, label)" pairs from the previous years. 
+    if args.num_fit > 0:
+        inputs_fit, labels_fit = prev_fit_data(args.prev_year, args.num_fit, args.pos)
 
     model = args.model
     mdl_name = ""
     if model in benchmarks:
         mdl_name =  model
         model = benchmarks[model]
+        model_args = None
+    elif model == "TabPFN":
+        mdl_name = model 
+        model = TabPFNRegressor(device = args.device)
         model_args = None
     else:
         model_args = None
@@ -132,13 +143,64 @@ def main():
             model_args = model.args
 
     # Now try to get the actual hockey data. 
-    inputs, labels = hockey_data(args.prev_season_file, args.next_season_file, args.pos) #length N.
-    inputs = torch.from_numpy(inputs[np.newaxis, :, np.newaxis]).to(args.device).float() # 1 x N x 1
-    labels = torch.from_numpy(labels[np.newaxis, :, np.newaxis]).to(args.device).float()
+    if args.num_fit > 0:
+        prev, labels = prev_fit_data_npmle(args.prev_year, args.next_year, args.num_fit, args.pos)
+        inputs = prev[:,-1]
+        #inputs_fit = prev[:, :-1].flatten()
+        #labels_fit = prev[:, 1:].flatten()
+        if mdl_name == "TabPFN":
+            inputs_fit_tabpfn = prev[:, :-1]
+            labels_fit_tabpfn = prev[:, -1]
+            inputs_tabpfn = prev[:, 1:]
+            # Need to fit identity of the players too? 
+            ids = pd.Series(range(prev.shape[0]), dtype="category")
+            # ids_all = np.tile(ids.values, args.num_fit)
+            inputs_fit_tabpfn = np.concatenate([inputs_fit_tabpfn, ids.values[:, np.newaxis]], axis = 1)
+            inputs_tabpfn = np.concatenate([inputs_tabpfn, ids.values[:, np.newaxis]], axis = 1)
+            model.fit(inputs_fit_tabpfn, labels_fit_tabpfn)
+    else:
+        inputs, labels = hockey_data(args.prev_season_file, args.next_season_file, args.pos) #length N.
+        # Let's try to fit zeros into TabPFN. 
+        if mdl_name == "TabPFN":
+            # Maybe fit 0 to 100?
+            #inputs_fit_tabpfn = np.array([0, 50])[:, np.newaxis] # 100 x 1
+            #labels_fit_tabpfn = np.array([1, 34])
+            inputs_fit_tabpfn = np.array([0, 50])[:, np.newaxis]
+            labels_fit_tabpfn = np.array([0, 50])
+            model.fit(inputs_fit_tabpfn, labels_fit_tabpfn) # 100 x 1
+            inputs_tabpfn = inputs[:, np.newaxis] # N x 1
+    if mdl_name == "TabPFN":
+        labels = torch.from_numpy(labels).float()
+    else:
+        inputs = torch.from_numpy(inputs[np.newaxis, :, np.newaxis]).to(args.device).float() # 1 x N x 1
+        labels = torch.from_numpy(labels[np.newaxis, :, np.newaxis]).to(args.device).float()
     # Then predict?
     with torch.inference_mode():
         start_time = time.time()
-        outputs = model(inputs).float()
+        if mdl_name == "TabPFN":
+            outputs = torch.from_numpy(model.predict(inputs_tabpfn)).float()
+        elif mdl_name == "fixed_grid_npmle":
+            if args.num_fit > 0: 
+                from mindist_est.npmle_fadi import poison_eb_fixed_grid_npmle
+                prev_sum = torch.from_numpy(prev.sum(axis = 1)).to(args.device).float()
+                #outputs = poison_eb_fixed_grid_npmle(prev_sum, inputs * (args.num_fit + 1)) / (args.num_fit + 1)
+                outputs = poison_eb_fixed_grid_npmle(prev_sum, prev_sum) / (args.num_fit + 1)
+            else:
+                outputs = model(inputs).float()
+        elif isinstance(model, EBTransformer):
+            if args.num_fit > 0: 
+                prev_sum = torch.from_numpy(prev.sum(axis = 1)[np.newaxis, :, np.newaxis]).to(args.device).float()
+                outputs = model(prev_sum) / (args.num_fit + 1)
+            else:
+                outputs = model(inputs).float()
+        else:
+            if args.num_fit > 0:
+                N = inputs.shape[1]
+                inputs_fit = torch.from_numpy(inputs_fit[np.newaxis, :, np.newaxis]).to(args.device).float()
+                inputs_all = torch.cat([inputs_fit, inputs], dim = 1)
+                outputs = model(inputs_all)[:, -N:, :].float()
+            else:
+                outputs = model(inputs).float()
         end_time = time.time()
         inference_time = end_time - start_time
 

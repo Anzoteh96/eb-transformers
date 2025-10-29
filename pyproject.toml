@@ -1,0 +1,10 @@
+[project]
+name = "eb-transformer"
+version = "0.1.0"
+
+[tool.setuptools.package-dir]
+"" = "src"
+
+# Declare single-file modules that live directly under src/
+[tool.setuptools]
+py-modules = ["custom_transformer", "eb_transformer"]

@@ -1,8 +1,9 @@
 import torch
 import tqdm
-from custom_transformer import MyMultiHeadAttention
+from .custom_transformer import MyMultiHeadAttention
 from linformer import LinformerSelfAttention
-# import avg_dot_product
+from .temp_mha import TempMHA
+# import .avg_dot_product
 
 class EBTransformer(torch.nn.Module):
     def __init__(self, args):
@@ -11,7 +12,11 @@ class EBTransformer(torch.nn.Module):
         factory_kwargs = {"device": args.device, "dtype": args.dtype}
         # We augment each input with constant 1 dimension. Otherwise, for dinput=1
         # layernorm completely kills the magnitude of the input.
-        self.embed = torch.nn.Linear(args.dinput + 1, args.dmodel, **factory_kwargs)
+        if "one_hot" in args and args.one_hot is not None and args.one_hot > 0:
+            assert(args.dinput == 1), "One-hot encoding only works for dinput = 1"
+            self.embed = torch.nn.Embedding(args.one_hot, args.dmodel, **factory_kwargs)
+        else:
+            self.embed = torch.nn.Linear(args.dinput + 1, args.dmodel, **factory_kwargs)
         # Standard transformers have layernorms without weight sharing.
         # So we want to incorporate that while making sure that previous transformers (layernorms w weight sharing) still works well.
         no_prenorm = "no_prenorm" in self.args and self.args.no_prenorm 
@@ -74,10 +79,13 @@ class EBTransformer(torch.nn.Module):
         # Here we distinguish between weight tieing. 
         if "att_activ" not in args:
             args.att_activ = "softmax"
-        assert args.att_activ in ["softmax", "relu", "sigmoid", "linformer", "linear", "linear_relu", "linear_sigmoid", "linear_gelu"], \
+        activ_list = ["softmax", "relu", "sigmoid", "linformer", "linear", "linear_relu", 
+                      "linear_sigmoid", "linear_sigmoid_normalize", "linear_gelu", "linear_softmax", "fla"]
+        assert args.att_activ in activ_list, \
             "Activations for attention other than softmax, sigmoid, ReLU and linformer are not supported"
             
-        if args.att_activ in ["relu", "sigmoid", "linear", "linear_relu", "linear_sigmoid", "linear_gelu"]:
+        if args.att_activ in ["relu", "sigmoid", "linear", "linear_relu", "linear_sigmoid", 
+                              "linear_sigmoid_normalize", "linear_gelu", "linear_softmax"]:
             self.self_attn = torch.nn.ModuleList(
                 [
                     MyMultiHeadAttention(
@@ -98,6 +106,14 @@ class EBTransformer(torch.nn.Module):
                         one_kv_head = False,
                         share_kv = False
                     )
+                    for _ in range(self.num_different_weights)
+                ]
+            ).to(args.device)
+        elif args.att_activ == "fla": # Flash linear attention
+            from fla.layers import MultiScaleRetention
+            self.self_attn = torch.nn.ModuleList(
+                [
+                    MultiScaleRetention(hidden_size = args.dmodel,num_heads = args.heads)
                     for _ in range(self.num_different_weights)
                 ]
             ).to(args.device)
@@ -129,29 +145,42 @@ class EBTransformer(torch.nn.Module):
             self.norm3 = torch.nn.LayerNorm(args.dmodel, **factory_kwargs)
 
         self.decoder = torch.nn.Linear(args.dmodel, args.dinput, **factory_kwargs)
+        self._init_params()
+        return None
+    def _init_params(self):
+        # Initialization trick from the "Attention is all you need" paper.
+        for p in self.parameters():
+            if p.dim() > 1:
+                torch.nn.init.xavier_uniform_(p)
         return None
 
-    def forward(self, inputs, num_padding: int = 0, store_activations: bool = False):
+    def forward(self, inputs, weights = None, num_padding: int = 0, store_activations: bool = False):
         """
             Args:
                 inputs: B x N x d_in
+                weight: optional weights for each input (for weighted MSE loss and weighted attention), 
+                # must be in the form B x N x N or N x N. 
                 num_padding: number of padding tokens (if any)
                 store_activations: whether to store activations for each layer (linear probe purpose)
         """
-        # Add dummy dimension to help avoid killing input's magnitude by the LayerNorm.
         # inputs is BxTxd_in. inputs_aux is BxTx(d_in+1).
-        
+
         self.num_different_weights = self.args.weight_share if self.args.weight_share > 0 else self.args.layers
-        ones = torch.ones(inputs.shape[0], inputs.shape[1], 1).to(self.args.device)
-        inputs_aux = torch.cat([inputs, ones], dim=2)
-        if num_padding > 0: 
-            pad_zero = torch.zeros(inputs_aux.shape[0], num_padding, inputs.shape[2]).to(self.args.device)
-            pad_one = -torch.ones(inputs_aux.shape[0], num_padding, 1).to(self.args.device)
-            pad_space = torch.cat([pad_zero, pad_one], dim = 2)
-            inputs_aux = torch.cat([inputs_aux, pad_space], dim = 1)
-        emb = self.embed(inputs_aux)
-        # We need to add padding as "empty space", which will be the form (1, 0). 
-        
+        # Can we do one-hot encoding?
+        if "one_hot" in self.args and self.args.one_hot is not None and self.args.one_hot > 0:
+            # Here, we encode everything as one-hot, where we assume clip all inputs to dinput - 1. 
+            inputs_clamp = torch.clamp(inputs, min = 0, max = self.args.one_hot - 1)
+            emb = self.embed(inputs_clamp.long()).reshape(inputs.shape[0], inputs.shape[1], -1)
+        else:
+            ones = torch.ones(inputs.shape[0], inputs.shape[1], 1).to(self.args.device)
+            inputs_aux = torch.cat([inputs, ones], dim=2)
+            if num_padding > 0: 
+                pad_zero = torch.zeros(inputs_aux.shape[0], num_padding, inputs.shape[2]).to(self.args.device)
+                pad_one = -torch.ones(inputs_aux.shape[0], num_padding, 1).to(self.args.device)
+                pad_space = torch.cat([pad_zero, pad_one], dim = 2)
+                inputs_aux = torch.cat([inputs_aux, pad_space], dim = 1)
+            emb = self.embed(inputs_aux)
+            # We need to add padding as "empty space", which will be the form (1, 0). 
 
         no_prenorm = "no_prenorm" in self.args and self.args.no_prenorm 
         no_postnorm = "no_postnorm" in self.args and self.args.no_postnorm
@@ -162,6 +191,9 @@ class EBTransformer(torch.nn.Module):
                 "activations": [emb],
                 "mlp_step": [None],
                 "attn_step": [None],
+                "prenorm_step": [None],
+                "postnorm_step": [None],
+                "attn_pre_step": [None],
                 #"out": [self.decoder(emb)],
             }
 
@@ -176,12 +208,31 @@ class EBTransformer(torch.nn.Module):
                     tmp = self.norm[idx](emb)
             else:
                 tmp = emb
+            if store_activations:
+                all_activations["prenorm_step"].append(tmp)
+            
+            # Implement Self-Attention module
             if self.args.att_activ == "linformer":
                 tmp = self.self_attn[idx](tmp)
-            else:
+            elif self.args.att_activ == "fla":
+                tmp,_,_ = self.self_attn[idx](tmp)
+            elif "temperature" in self.args and self.args.temperature is not None:
                 tmp, _ = self.self_attn[idx](
-                    tmp, tmp, tmp, attn_mask=self.mask, need_weights=False
+                    tmp, tmp, tmp, attn_mask=self.mask, need_weights=False, temperature = self.args.temperature
                 )
+            else:
+                if weights is not None and isinstance(self.self_attn[idx], torch.nn.MultiheadAttention):
+                    assert self.mask is None, "Causal attention with weights not supported yet."
+                    log_weights = torch.log(weights + 1e-20) # Should have size B x N x N
+                    tmp, _ = self.self_attn[idx](
+                        tmp, tmp, tmp, attn_mask=log_weights.repeat_interleave(self.args.heads, dim=0), need_weights=False
+                    )
+                else:
+                    tmp, _ = self.self_attn[idx](
+                        tmp, tmp, tmp, attn_mask=self.mask, need_weights=False
+                    )
+            if store_activations:
+                all_activations["attn_pre_step"].append(tmp)
             
             # tmp = self.dropout(tmp);
             ## WARNING: do not use emb += .... since that op is inplace
@@ -193,6 +244,8 @@ class EBTransformer(torch.nn.Module):
                 else:
                     tmp = self.norm2[idx](emb)
             # Check if we need to incorporate MLP. 
+            if store_activations:
+                all_activations["postnorm_step"].append(tmp)
             
             attn_only = self.args.attn_only if "attn_only" in self.args else self.attn_only
             if not attn_only:
@@ -216,11 +269,13 @@ class EBTransformer(torch.nn.Module):
             emb = emb[:, :-num_padding, :]
 
         out = self.decoder(emb)
-        # To ensure that we only prediction nonnegative values, we add a final relu step.
+        # For Poisson channel, to ensure that we only predict nonnegative values, we add a final relu step. 
         # Note that ReLU can turn bad if your network start with all negative values (or get into that at one point),
         # let's do GELU instead.
-        gelu = torch.nn.GELU()
-        out = gelu(out)
+        channel = "poisson" if "channel" not in self.args else self.args.channel
+        if channel == "poisson":
+            gelu = torch.nn.GELU()
+            out = gelu(out)
         if store_activations:
             return out, all_activations 
         else:
@@ -233,7 +288,7 @@ class EBTransformer(torch.nn.Module):
             labels: B x N x d_in
             num_padding: number of padding tokens (if any)
         """
-        out = self.forward(inputs, num_padding)
+        out = self.forward(inputs, num_padding = num_padding)
         loss = ((out - labels) ** 2).sum() / inputs.numel()
         return loss
 
@@ -273,13 +328,17 @@ class EBTransformer(torch.nn.Module):
 
     def get_layer_activation(self, inputs, layer):
         self.eval()
-        _, activations = self.forward(inputs, 0, True)
+        _, activations = self.forward(inputs, num_padding = 0, store_activations = True)
         return {
             "activations": activations["activations"][layer],
             "mlp_step": activations["mlp_step"][layer],
-            "attn_step": activations["attn_step"][layer]
+            "attn_step": activations["attn_step"][layer],
+            "attn_pre_step": activations["attn_pre_step"][layer],
+            "prenorm_step": activations["prenorm_step"][layer],
+            "postnorm_step": activations["postnorm_step"][layer]
         }
-
+    
+    # TODO: fix this. 
     def get_avg_dot_product_of_intermediates(self, inputs):
         """
         return an ordered list of n names of collected features,
@@ -341,3 +400,46 @@ class EBTransformer(torch.nn.Module):
         similarity_matrix = avg_dot_product.pairwise_average_similarity_matrix(tensors)
 
         return similarity_matrix, names
+
+
+class EBTransformerTruncate(EBTransformer):
+    def __init__(self, base_model, device, num_layers_to_keep):
+        self.args = base_model.args 
+        self.args.device = device
+        self.args.layers = num_layers_to_keep
+        super(EBTransformerTruncate, self).__init__(self.args)
+
+        # Next, we copy the weights from the base model, up until num_layers_to_keep.
+        self.copy_weights(base_model)
+        
+        # Keep only the decoder's gradient.
+        for param in self.parameters():
+            param.requires_grad = False
+        for param in self.decoder.parameters():
+            param.requires_grad = True
+    
+    def copy_weights(self, base_model):
+        self.embed.load_state_dict(base_model.embed.state_dict())
+        if self.args.norm_share:
+            if "no_prenorm" not in self.args or not self.args.no_prenorm:
+                self.norm.load_state_dict(base_model.norm.state_dict())
+            if "no_postnorm" not in self.args or not self.args.no_postnorm:
+                self.norm2.load_state_dict(base_model.norm2.state_dict())
+        else:
+            if "no_prenorm" not in self.args or not self.args.no_prenorm:
+                for i in range(self.num_different_weights):
+                    self.norm[i].load_state_dict(base_model.norm[i].state_dict())
+            if "no_postnorm" not in self.args or not self.args.no_postnorm:
+                for i in range(self.num_different_weights):
+                    self.norm2[i].load_state_dict(base_model.norm2[i].state_dict())
+        if not self.attn_only:
+            for i in range(self.num_different_weights):
+                self.linear1[i].load_state_dict(base_model.linear1[i].state_dict())
+                self.linear2[i].load_state_dict(base_model.linear2[i].state_dict())
+        for i in range(self.num_different_weights):
+            self.self_attn[i].load_state_dict(base_model.self_attn[i].state_dict())
+        if self.args.decoding_layer_norm:
+            self.norm3.load_state_dict(base_model.norm3.state_dict())
+        self.decoder.load_state_dict(base_model.decoder.state_dict())
+        return None
+    

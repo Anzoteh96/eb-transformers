@@ -16,8 +16,8 @@ import torch
 import tqdm
 import torch.nn.functional as F
 from eb_transformer import EBTransformer
-from gen_priors import DirichletProcess, RandMultinomial, NeuralPrior
-
+from gen_priors import DirichletProcess, RandMultinomial, NeuralPrior, ExponentialPrior
+from algo_helpers import eval_regfunc
 
 
 # Helper function that calculates the number of parameters.
@@ -31,7 +31,6 @@ def get_n_params(model):
     return pp
 
 
-# import ipdb
 def plot_thetas(args):
     print(f"Generating a few samples of the distributions of Thetas used")
     fig, axs = plt.subplots(4, 4)
@@ -41,7 +40,6 @@ def plot_thetas(args):
         ax.hist(thetas.flatten().numpy(), bins=500, density=True)
         ax.set_ylim([0, 0.2])
         ax.set_xlim([0, args.theta_max])
-    # ipdb.set_trace();
 
     axs.flatten()[0].set_title(f"B = {args.batch}, S={args.seqlen}, dim={args.dinput}")
     # plt.show();
@@ -65,9 +63,13 @@ def get_batch(args, return_prior=False):
         args.theta_max,
         args.dinput,
     )
+    
+    args.has_negative = (args.channel == "gaussian")
+   
     # How do we get priors?
     if args.prior == "neural":
         prior = NeuralPrior(args)
+        
         thetas = prior.gen_thetas()
 
     elif args.prior == "dirichlet":
@@ -78,7 +80,7 @@ def get_batch(args, return_prior=False):
     elif args.prior == "multinomial":
         # Two cases: prior_file is given (in which case we just use it),
         # or not given (then we use RandMultinomial)
-        if args.prior_file is not None:
+        if "prior_file" in args and args.prior_file is not None:
             # Now read the file. 
             lst = np.load(args.prior_file)
             atoms, probs = (torch.from_numpy(lst['atoms']).to(args.device), 
@@ -89,6 +91,10 @@ def get_batch(args, return_prior=False):
             prior = Multinomial(args)
         else:
             prior = RandMultinomial(args)
+        thetas = prior.gen_thetas()
+    
+    elif args.prior == "exponential":
+        prior = ExponentialPrior(args)
         thetas = prior.gen_thetas()
 
     elif args.prior == "mixture":
@@ -122,14 +128,34 @@ def get_batch(args, return_prior=False):
             )  # This is gonna be B x seqlen x dinput
             thetas = torch.where(mask, theta_dirichlet, theta_neural)
         prior = [(neural_prior, 1 - args.dirich_prob), (mydirich, args.dirich_prob)]
-
-    inputs = torch.poisson(thetas).to(args.device)
+    
+    # Think of how we want to support non-Poisson models. 
+    channel = "poisson" if not ("channel" in args) else args.channel
+    assert channel in ["poisson", "gaussian"], (
+        f"Channel {channel} is not supported, only poisson and gaussian are supported"
+    )
+    if channel == "gaussian":
+        # For Gaussian, we sample from a normal distribution with mean = thetas and std = 1.
+        inputs = torch.normal(mean=thetas, std=1.0).to(args.device)
+    else:
+        # Here there will be a need to check that all thetas are nonnegative. 
+        if torch.any(thetas < 0):
+            raise ValueError(
+                "Poisson channel requires all thetas to be nonnegative, but found negative thetas."
+            )
+        inputs = torch.poisson(thetas).to(args.device)
     labels = thetas
+
+    if args.prior != "mixture":
+        #cov_est, corr_est = prior.get_cov_est()
+        #print(cov_est, corr_est)
+        #bayes_est = prior.gen_bayes_est(inputs)
+        pass
+
     if return_prior:
         return (inputs, labels), prior
     else:
         return (inputs, labels)
-
 
 def train(args, model=None):
     if model is None:
@@ -167,6 +193,8 @@ def train(args, model=None):
     total_mle_loss = 0.0
     total_grad_norm = 0.0
     clip_grad = 0
+    loss_list = []
+    norm_loss_list = [] # divided by MLE loss 
     for step in tqdm.tqdm(range(args.train_steps), disable=args.tqdm_disable):
         # model.param_report();
 
@@ -185,7 +213,10 @@ def train(args, model=None):
         optimizer.step()
 
         total_loss += loss.item()
-        total_mle_loss += ((inputs - labels) ** 2).sum() / inputs.numel()
+        loss_list.append(loss.item())
+        mle_loss = ((inputs - labels) ** 2).sum() / inputs.numel()
+        norm_loss_list.append(loss.item() / mle_loss.item())
+        total_mle_loss += mle_loss
         if step % args.train_lr_epoch == 0 and step > 0:
             scheduler.step()
 
@@ -214,13 +245,132 @@ def train(args, model=None):
                 with open(store_filename, "wb") as f:
                     outdict.update({"model": model})
                     outdict.update({"step": step})
+                    outdict.update({"loss": np.array(loss_list)})
+                    outdict.update({"norm_loss": np.array(norm_loss_list)})
                     outdict.update({"loss_ratio": cur_loss/mle_loss})
                     pickle.dump(outdict, f)
 
     # model.param_report();
 
-    return {"model": model}
+    return {"model": model, "loss": np.array(loss_list), "norm_loss": np.array(norm_loss_list)}
 
+def train_getbayes(args, model=None):
+    assert(args.channel == "poisson"), "Currently only support poisson channel for train_getbayes"
+    if model is None:
+        model = EBTransformer(args)
+        model.nr_steps = 0
+    
+    # Add a mechanism to temporarily store outputs every 300 (or so) epochs. 
+    if args.store_temp_model:
+        store_filename = args.fname_prefix + "_temp_model.pkl"
+        outdict = {
+            "args": args,
+        }
+    
+    num_params = get_n_params(model)
+    print("Number of parameters: {}".format(num_params))
+
+    lr = args.train_lr
+    ad_eps = 0.01
+    print(
+        f"EB trans: Using Adam, initial rate={lr:.3g}, eps = {ad_eps:.3g}, interval={args.train_lr_epoch}, gamma={args.train_lr_gamma}"
+    )
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, eps=ad_eps)
+    scheduler = torch.optim.lr_scheduler.StepLR(
+        optimizer, 1.0, gamma=args.train_lr_gamma
+    )
+    real_start_time = time.time()
+    start_time = time.time()
+
+    model.train()  # turn on train mode
+    log_interval = args.train_lr_epoch // 5
+    # log_interval = 10;
+    total_loss = 0.0
+    total_mle_loss = 0.0
+    total_grad_norm = 0.0
+    clip_grad = 0
+    loss_list = []
+    norm_loss_list = [] # divided by MLE loss 
+    for step in tqdm.tqdm(range(args.train_steps), disable=args.tqdm_disable):
+        # model.param_report();
+
+        (_, labels), prior = get_batch(args, return_prior = True)
+        max_tokens = 2 * (labels.max().int() + 1)
+        inputs = torch.arange(max_tokens).float().to(args.device).reshape(1, -1, 1)
+        # bayes_est = prior.gen_bayes_est(inputs.reshape(-1, 1), channel = args.channel)
+        lambdas = labels.flatten()
+        bayes_est = eval_regfunc(lambdas, torch.ones_like(lambdas)/lambdas.numel(), inputs.reshape(-1, 1))
+        # Now we need to get the PMFs too. 
+        # Now get the log PMF (scaled by constant).
+        log_pmf_lst = [0]
+        for i, p in zip(inputs[0, :-1], bayes_est[:-1]):
+            ell = log_pmf_lst[-1]
+            # p = (i + 1) * pmf[i+1] / pmf[i] 
+            # => pmf[i+1] = pmf[i] * p / (i + 1)
+            ell_next = ell + torch.log(p) - torch.log(i + 1)
+            log_pmf_lst.append(ell_next.item())
+        
+        log_pmf = torch.Tensor(log_pmf_lst).reshape(1, -1, 1).to(args.device)
+        # Now let's normalize the PMF. 
+        log_pmf = log_pmf - torch.logsumexp(log_pmf, dim=1, keepdim=True)
+        attn_mask = log_pmf[:,:,0].unsqueeze(-2).expand(-1, log_pmf.shape[1], -1)
+        outputs = model(inputs, weights=torch.exp(attn_mask))
+        weighted_loss = torch.sum((outputs - bayes_est) ** 2 * torch.exp(log_pmf))
+        #from IPython import embed; embed()
+        
+        optimizer.zero_grad()
+        weighted_loss.backward()
+        norm_type = 2
+        total_norm = torch.norm(
+            torch.stack(
+                [torch.norm(p.grad.detach(), norm_type) for p in model.parameters()]
+            ),
+            norm_type,
+        )
+        total_grad_norm += total_norm
+        optimizer.step()
+
+        total_loss += weighted_loss.item()
+        loss_list.append(weighted_loss.item())
+        mle_loss = ((inputs - bayes_est) ** 2 * torch.exp(log_pmf)).sum()
+        norm_loss_list.append(weighted_loss.item() / mle_loss.item())
+        total_mle_loss += mle_loss
+        if step % args.train_lr_epoch == 0 and step > 0:
+            scheduler.step()
+
+        if step % log_interval == 0 and step > 0:
+            lr = scheduler.get_last_lr()[0]
+            ms_per_batch = (time.time() - start_time) * 1000 / log_interval
+            cur_loss = total_loss / log_interval
+            mle_loss = total_mle_loss / log_interval
+            tot_tim = time.time() - real_start_time
+            avg_grad_norm = total_grad_norm / log_interval
+            print(
+                f"TRN | time {tot_tim / 60:4.1f} m | step {step:7d} | "
+                f"lr {lr:.4g} | ms/batch {ms_per_batch:5.2f} | "
+                f"norm grad = {avg_grad_norm:.3g} | "
+                f"loss {cur_loss:5.2f} = {cur_loss / mle_loss:1.4f} MLE"
+            )
+            total_loss = 0.0
+            total_grad_norm = 0.0
+            total_mle_loss = 0.0
+            start_time = time.time()
+            if math.isnan(avg_grad_norm) or math.isnan(cur_loss):
+                print("... ABORTING THIS RUN ...")
+                return None
+            if args.store_temp_model:
+                print(f"Storing temporary model to {store_filename}")
+                with open(store_filename, "wb") as f:
+                    outdict.update({"model": model})
+                    outdict.update({"step": step})
+                    outdict.update({"loss": np.array(loss_list)})
+                    outdict.update({"norm_loss": np.array(norm_loss_list)})
+                    outdict.update({"loss_ratio": cur_loss/mle_loss})
+                    pickle.dump(outdict, f)
+
+    # model.param_report();
+
+    return {"model": model, "loss": np.array(loss_list), "norm_loss": np.array(norm_loss_list)}
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="eb_train")
@@ -236,6 +386,9 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--seqlen", type=int, default=512, help="maximal length of the input"
+    )
+    parser.add_argument(
+        "--one_hot", type=int, default=None, help="One hot encoding"
     )
     # For weight sharing, there are three versions that we're thinking.
     # no weight share (one weight throughout), completely different (multiple weights), or two weights (first half, second half).
@@ -267,6 +420,16 @@ if __name__ == "__main__":
     parser.add_argument(
         "--theta_max_israndom", action="store_true", help="are thetamax random?"
     )
+
+    # Below, we will consider Gaussian channels, if applicable. 
+    parser.add_argument(
+        "--channel",
+        type=str,
+        default="poisson",
+        help="channel type (poisson|gaussian)",
+    )
+
+    parser.add_argument("--train_bayes", action="store_true", help="train to get bayes estimator")
 
     ### Neural Net hyperparams
     parser.add_argument("--step", type=float, default=0.5, help="Layer gain")
@@ -339,6 +502,18 @@ if __name__ == "__main__":
         action="store_true",
         help="Store temporary model every N epochs",
     )
+    parser.add_argument(
+        "--rotate",  action="store_true", help="apply random rotation to inputs and labels"
+    )
+    parser.add_argument(
+        "--atoms_locations", type=str, default=None, help="locations of atoms for multinomial prior"
+    )
+    parser.add_argument(
+        "--num_atoms", type=int, default=0, help="number of atoms for multinomial prior"
+    )
+    parser.add_argument(
+        "--model_file", type=str, default=None, help="pretrained model file"
+    )
     args = parser.parse_args()
     if torch.cuda.is_available():
         args.device = "cuda"
@@ -372,7 +547,20 @@ if __name__ == "__main__":
 
     if True:
         print("Using the following settings:\n", args)
-        main_res = train(args)
+        if args.model_file is not None:
+            print(f"Loading model from {args.model_file}")
+            with open(args.model_file, "rb") as f:
+                tmpdict = pickle.load(f)
+                model = tmpdict["model"]
+            if args.train_bayes:
+                main_res = train_getbayes(args, model=model)
+            else:
+                main_res = train(args, model=model)
+        else:
+            if args.train_bayes:
+                main_res = train_getbayes(args)
+            else:
+                main_res = train(args)
         outdict.update(main_res)
         with open(fname_prefix + ".pkl", "wb") as f:
             pickle.dump(outdict, f)

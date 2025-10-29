@@ -35,13 +35,14 @@ if __name__ == "__main__":
     
     eval_dict = {key: defaultdict(lambda : defaultdict(lambda : [])) for key in met_keys}
 
-    mses_df, args_col = extract_evals(indir, 'mses')
+    mses_df, args_col = extract_evals(indir, "", [], 'mses', True)
     # print(mses_df)
     # normed_df, _ = extract_evals(indir, 'norm_mses')
 
-    tstats_mses, pval_mses = get_tstats(mses_df, args_col)
+   
 
     mses_vals_df = mses_df.drop(args_col, axis = 1).dropna(axis = 1)
+    
     mses_vals = mses_vals_df.values # A numpy array. 
     mses_avg = np.mean(mses_vals, axis = 1)
     mses_std = np.std(mses_vals, axis = 1)
@@ -69,6 +70,7 @@ if __name__ == "__main__":
 
     # Now that we have the results, we can just dump things. 
     results_df = results_df.sort_values("coefs", ascending = False).set_index("Model")
-    results_df.to_csv(os.path.join(indir, "results.csv"), float_format='%.3f')
+    results_df.to_csv(os.path.join(indir, "results.csv"), float_format='%.4f')
+    tstats_mses, pval_mses = get_tstats(mses_df, args_col)
     tstats_mses.to_csv(os.path.join(indir, "tstats.csv"), float_format='%.3f')
     # TODO: add plots for everything. 

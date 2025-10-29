@@ -1,0 +1,11 @@
+README.md
+pyproject.toml
+src/custom_transformer.py
+src/eb_transformer/__init__.py
+src/eb_transformer/avg_dot_product.py
+src/eb_transformer/custom_transformer.py
+src/eb_transformer/eb_transformer.py
+src/eb_transformer.egg-info/PKG-INFO
+src/eb_transformer.egg-info/SOURCES.txt
+src/eb_transformer.egg-info/dependency_links.txt
+src/eb_transformer.egg-info/top_level.txt

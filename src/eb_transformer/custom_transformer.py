@@ -5,14 +5,21 @@ import math
 import torch.nn.functional as F
 from typing import Callable, Optional, TYPE_CHECKING, Union
 
+#from fast_transformers.feature_maps.activation import ActivationFunctionFeatureMap
+#from fast_transformers.attention import LinearAttention
+#from fast_transformers.transformers import TransformerEncoderLayer
+
+# Let's do the fast linear attention. 
+
 # Can we define like a ReLU version of Attn function? 
 
-def linear_attention(query, key, value, attn_mask=None, dropout_p=0.0, phi = None, need_weights=True):
+def linear_attention(query, key, value, attn_mask=None, normalize = False, dropout_p=0.0, phi = None, need_weights=True):
     """
         Args:
             query: B1, B2, M, D1 
             key: B1, B2, N, D1
             value: B1, B2, N, D2
+            normalize: whether to normalize the attention weights
             phi: function
         returns:
             attn_output: B1, B2, M, D2
@@ -23,14 +30,21 @@ def linear_attention(query, key, value, attn_mask=None, dropout_p=0.0, phi = Non
     # from IPython import embed; embed() 
     S = torch.matmul(phi(key).transpose(-2, -1), value) / N # B1, B2, D1, D2
     attn_output = torch.matmul(phi(query), S) # B1, B2, M, D2
-    attn_output = torch.dropout(attn_output, dropout_p, train=True)
+    attn_output = torch.dropout(attn_output, dropout_p, train=True) # Not used for now. 
+    if normalize:
+        key_sum = torch.sum(phi(key).transpose(-2, -1), dim=-1, keepdim=True) # B1, B2, D1, 1
+        div_factor = torch.matmul(phi(query), key_sum) # B1, B2, M, 1
+        attn_output = attn_output * N / div_factor # B1, B2, M, D2
+        if torch.isnan(attn_output).any():
+            print("NaN detected in attn_output")
+            raise ValueError("NaN detected in attn_output")
     if need_weights:
         return attn_output, S
     else:
         return attn_output, None
     return attn_output
 
-# To do so, we need to first do the following ReLU operation. 
+# This is mostly from https://pytorch.org/tutorials/intermediate/transformer_building_blocks.html#multiheadattention
 def my_scaled_dot_product_attention(query, key, value, attn_mask=None, dropout_p=0.0,
         is_causal=False, scale=None, enable_gqa=False, activation_func = "softmax", need_weights=True) -> torch.Tensor:
     """
@@ -84,6 +98,7 @@ def my_scaled_dot_product_attention(query, key, value, attn_mask=None, dropout_p
     else:
         return attn_weight @ value, None
 
+# Here we have the MHA, but supports different attention functions. 
 class MyMultiHeadAttention(nn.Module):
     """
     Computes multi-head attention. Supports nested or padded tensors.
@@ -195,17 +210,29 @@ class MyMultiHeadAttention(nn.Module):
         # Step 3. Run my_SDPA
         # Optionally, apply the "linear" version. 
         # (N, nheads, L_t, E_head)
-        if self.activation in ["linear", "linear_relu", "linear_sigmoid", "linear_gelu"]:
-            if self.activation == "linear":
+        if self.activation in ["linear", "linear_relu", "linear_sigmoid", "linear_gelu"
+                               , "linear_sigmoid_normalize", "linear_softmax"]:
+            # Note: normalizing only works when phi produces only positive values. 
+            if self.activation == "linear": # This works best for now. 
                 phi = lambda x: x 
+                normalize = False
             elif self.activation == "linear_relu":
                 phi = F.relu
+                normalize = False
             elif self.activation == "linear_sigmoid":
                 phi = F.sigmoid
+                normalize = False
+            elif self.activation == "linear_sigmoid_normalize":
+                phi = F.sigmoid
+                normalize = True
             elif self.activation == "linear_gelu":
                 phi = F.gelu
+                normalize = False
+            elif self.activation == "linear_softmax":
+                phi = torch.exp
+                normalize = True
             attn_output, attn_weight = linear_attention(
-                query, key, value, attn_mask=attn_mask, dropout_p=self.dropout, phi = phi, need_weights = need_weights
+                query, key, value, attn_mask=attn_mask, normalize = normalize, dropout_p=self.dropout, phi = phi, need_weights = need_weights
             )
         else:
             attn_output, attn_weight = my_scaled_dot_product_attention(

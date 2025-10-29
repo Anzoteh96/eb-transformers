@@ -8,29 +8,17 @@ import os
 import numpy as np
 from tqdm import tqdm
 import math
-from eb_transformer import EBTransformer
+import copy
+from eb_transformer import EBTransformer, custom_transformer
+from eb_transformer.temp_mha import TempMHA,  convert_model_mha_to_temp
 from eb_train import get_n_params
+#from mlp import MLP
 from gen_priors import NeuralPrior, DirichletProcess, WorstPrior
 import random
-from algo_helpers import robbins, erm_helper, erm, fixed_grid_npmle, eval_regfunc, npmle
+from algo_helpers import robbins, erm_helper, erm, fixed_grid_npmle, eval_regfunc, npmle, james_stein
 import sys
 import time
-
-class TorchCpuUnpickler(pickle.Unpickler):
-    def find_class(self, module, name):
-        if module == 'torch.storage' and name == '_load_from_bytes':
-            return lambda b: torch.load(io.BytesIO(b), map_location='cpu')
-        else:
-            return super().find_class(module, name)
-
-def load_model_dict(filename, device):
-    file = open(filename, 'rb')
-    if device == 'cpu':
-        return TorchCpuUnpickler(file).load()
-    elif device == 'cuda':
-        return pickle.load(file)
-    else:
-        raise ValueError('Unknown device')
+from utils import load_model_dict, convert_tensor_to_bincount, model_input_bincounts
 
 
 def set_seed(seed: int = 42) -> None:
@@ -81,13 +69,14 @@ def gen_batch_from_seed(args, return_prior = False):
     """
     # The purpose of returning prior is so that we can calculate BayesEst. 
     # For now this is not supported by mixtures.
+    assert args.channel in ["poisson", "gaussian"], "only Poisson and Gaussian channels are supported for now"
     set_seed(args.seed)
     prior = None # The prior we use. 
-    if args.worst_prior:
+    if "worst_prior" in args and args.worst_prior:
         wp = WorstPrior(args, save_file = 'worst_priors/theta50_seed19.npz')
         labels = wp.gen_thetas()
         prior = wp
-    elif args.same_prior:
+    elif ("same_prior" in args and args.same_prior):
         labels = args.prior()
         prior = args.prior
     else:
@@ -102,8 +91,12 @@ def gen_batch_from_seed(args, return_prior = False):
         set_seed(args.seed)
         mask = torch.rand(*labels.shape).to(labels.device) < args.uniform_percentage
         uniform = torch.rand(*labels.shape).to(labels.device) * args.theta_max
-        labels[mask] = uniform[mask] 
-    inputs = torch.poisson(labels)
+        labels[mask] = uniform[mask]
+
+    if args.channel == "poisson":
+        inputs = torch.poisson(labels)
+    else:
+        inputs = torch.normal(mean = labels, std = 1)
 
     #print(f"input share {inputs.shape}, labels shape {labels.shape}")
     if return_prior:
@@ -114,13 +107,15 @@ def gen_batch_from_seed(args, return_prior = False):
 
 def get_batch_loss(model, args):
     if model == "bayes":
-        (inputs, labels), prior = gen_batch_from_seed(args, True)
+        (inputs, labels_raw), prior = gen_batch_from_seed(args, True)
     else:
-        (inputs, labels) = gen_batch_from_seed(args)
+        (inputs, labels_raw) = gen_batch_from_seed(args)
     # There are a few things we're trying to get: 
     # - The MSE of the model; 
     # - The normalized MSE of the model (normalize by the variance of the labels)
     # - The Bayes estimator of the model; 
+    labels = args.func(labels_raw)
+    del labels_raw
     
     # We first encode the variance. 
     labels_var = torch.var(labels)
@@ -128,8 +123,11 @@ def get_batch_loss(model, args):
 
     if model == npmle:
         outputs = model(inputs)
-    elif model == "bayes":
-        outputs = prior.gen_bayes_est(inputs)
+    elif model == "bayes": 
+        # If f is not identity, we apply f to Bayes estimator. 
+        # This is not the real Bayes estimator, but a reasonable proxy that we may compare against. 
+        raw_outputs = prior.gen_bayes_est(inputs, args.channel)
+        outputs = args.func(raw_outputs)
         inference_time = None
     elif model == "worst_prior":
         # Load model, for now we just have to hard code. 
@@ -157,7 +155,10 @@ def get_batch_loss(model, args):
                 start = torch.cuda.Event(enable_timing=True)
                 end = torch.cuda.Event(enable_timing=True)
                 start.record()
-                outputs = model(inputs)
+                if args.shrink_input_bincount:
+                    outputs = args.func(model_input_bincounts(model, inputs))
+                else:
+                    outputs = args.func(model(inputs))
                 end.record()
                 torch.cuda.synchronize()
                 inference_time = start.elapsed_time(end) / 1000
@@ -176,6 +177,7 @@ def get_batch_loss(model, args):
         with open(out_name, "wb") as f:
             pickle.dump((inputs, labels), f)
     cur_mse = torch.mean((outputs - labels) ** 2)
+    # print(cur_mse)
     normalized_mse = cur_mse / labels_var
     return cur_mse, normalized_mse, inference_time 
 
@@ -198,6 +200,7 @@ def main():
     print(sys.argv)
     parser = argparse.ArgumentParser(description='eb_arena')
     parser.add_argument('--model', help='name of model to use')
+    parser.add_argument('--temperature', type = float, default=None, help='temperature for sampling from the model')
     parser.add_argument('--seed', type = int, help='seed used to generate inputs')
     parser.add_argument('--start', type = int, help='first input this job is responsible for')
     parser.add_argument('--end', type = int, help='last input this job is responsible for')
@@ -205,6 +208,7 @@ def main():
     parser.add_argument('--save_random_input', type=bool, default=False, help='output dir passed by LLMapReduce')
     parser.add_argument('--same_prior', type=bool, default=False, help='output dir passed by LLMapReduce')
     parser.add_argument('--prior_seed', type=int, default=10)
+    parser.add_argument('--shrink_input_bincount',  action='store_true', help='whether to shrink input via bincounts before feeding into the model')
     
     parser.add_argument('--dbg_file', help='path to debug stuff')
     
@@ -217,6 +221,12 @@ def main():
     parser.add_argument('--dirich_prob', type=float, default=None, help = 'Dirichlet mixture probability')
     parser.add_argument('--uniform_percentage', type=float, default=0.0, help='percentage that')
     parser.add_argument('--prior_fit', action='store_true', help='do we want to overfit to a prior?')
+    parser.add_argument(
+        "--channel",
+        type=str,
+        default="poisson",
+        help="channel type (poisson|gaussian)",
+    )
     
     parser.add_argument('--dmodel', type=int, default=32, help='dimensionality of each token')
     parser.add_argument('--dinput', type=int, default=1, help='dimensionality of inputs and labels')
@@ -228,6 +238,9 @@ def main():
     parser.add_argument('--seqlen', type=int, default=512, help='maximal length of the input')
     parser.add_argument('--uniform_prior', action='store_true', help='Simplistic generation where thetas are sampled from a uniform prior')
     parser.add_argument('--worst_prior', action='store_true', help='Trying out worst prior')
+    parser.add_argument("--func", type=str, help="function of theta (default: identity)")
+    parser.add_argument('--out_file', type=str, default=None, help='file to output results to')
+
     args = parser.parse_args()
     args.mdl_name = args.model
     if torch.cuda.is_available():
@@ -243,13 +256,27 @@ def main():
     assert(args.end >= args.start), "End seed must be greater than or equal to start seed"
     benchmarks = {}
 
-    benchmarks['mle'] = lambda x : x
+    # Process the functions first. 
+    # Now process the function of the labels. 
+    if args.func == "square":
+        args.func = lambda x: x ** 2
+    elif args.func == "cube":
+        args.func = lambda x: x ** 3
+    elif args.func == "sqrt":
+        args.func = lambda x: torch.sqrt(x)
+    elif args.func == "log": # Get log(1+x) to avoid issues with log(0).
+        args.func = lambda x: torch.log(x + 1)
+    else:
+        args.func = lambda x: x
+
+    benchmarks['mle'] = args.func
     benchmarks['robbins'] = robbins
     benchmarks["erm"] = erm
     benchmarks["npmle"] = npmle
-    benchmarks["fixed_grid_npmle"] = fixed_grid_npmle
+    benchmarks["fixed_grid_npmle"] = (lambda x: fixed_grid_npmle(x, args.channel))
     benchmarks["bayes"] = "bayes"
     benchmarks["worst_prior"] = "worst_prior"
+    benchmarks["james_stein"] = james_stein
 
     model = args.model
     mdl_name = ""
@@ -267,11 +294,23 @@ def main():
             model.args.device = args.device
             model_args = model.args
             model_args.num_params = get_n_params(model)
+            if args.temperature is not None:
+                model.temperature = args.temperature
+                model_old = copy.deepcopy(model)
+                model = convert_model_mha_to_temp(model, default_temperature = args.temperature)
+                model.args.temperature = args.temperature
+                #input_dummy = torch.randn(2, 50, args.dinput).to(args.device)
+                #from IPython import embed; embed()
+
 
     mses, norm_mses, runtime = get_mses(model, args, args.seed)
     output = {"mses" : mses, "norm_mses": norm_mses, "time": runtime, "mdl_name": mdl_name, 
-    "args": model_args, "start": args.start, "end" : args.end, "uniform_percentage": args.uniform_percentage}
-    out_name = f"{args.llmap_out}{mdl_name}_{args.start}_{args.end}__{args.uniform_percentage}"
+    "args": model_args, "start": args.start, "end" : args.end, "uniform_percentage": args.uniform_percentage, 
+    "test_seqlen": args.seqlen, "test_batch": args.batch, "test_channel": args.channel}
+    if args.out_file is not None:
+        out_name = args.out_file
+    else:
+        out_name = f"{args.llmap_out}{mdl_name}_{args.start}_{args.end}__{args.uniform_percentage}"
     print("I am outputting here", out_name)
     with open(out_name, "wb") as f:
         pickle.dump(output, f)
