@@ -1,8 +1,7 @@
 import torch
-import tqdm
 from custom_transformer import MyMultiHeadAttention
 from linformer import LinformerSelfAttention
-# import avg_dot_product
+import avg_dot_product
 
 class EBTransformer(torch.nn.Module):
     def __init__(self, args):
@@ -338,6 +337,6 @@ class EBTransformer(torch.nn.Module):
         names.append(f"out")
         tensors.append(out)
 
-        similarity_matrix = avg_dot_product.pairwise_average_similarity_matrix(tensors)
+        similarity_matrix = avg_dot_product.pairwise_average_similarity_matrix(tensors) # Need to check if this works properly since I had to modify it myself
 
         return similarity_matrix, names

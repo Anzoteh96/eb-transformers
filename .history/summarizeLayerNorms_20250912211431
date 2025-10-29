@@ -1,0 +1,29 @@
+import re, statistics as st
+
+rows = []
+with open("eb_2025_09_12-19_47_I6x.log") as f:
+    for L in f:
+        m = re.search(r"Layer:\s*(.+?),\s*Grad norm:\s*([0-9eE\.\-]+)", L)
+        if m:
+            name, g = m.group(1), float(m.group(2))
+            comp = ("ln" if "norm" in name.lower() else
+                    "decoder" if "decoder" in name.lower() else
+                    "attn" if "attn" in name.lower() else
+                    "mlp" if ("linear1" in name.lower() or "linear2" in name.lower() or "fc" in name.lower()) else
+                    "embed" if "embed" in name.lower() else "other")
+            rows.append((name, comp, g))
+
+def stats(tag):
+    vals = [g for _, c, g in rows if c == tag]
+    return (len(vals), (st.mean(vals) if vals else 0.0), (max(vals) if vals else 0.0))
+
+for tag in ["ln","attn","mlp","decoder","embed","other"]:
+    n, mean_g, max_g = stats(tag)
+    if n:
+        print(f"{tag:7s}  n={n:3d}  mean_g={mean_g:8.3f}  max_g={max_g:8.3f}")
+
+# Top offenders
+top = sorted(rows, key=lambda x: x[2], reverse=True)[:10]
+print("\nTop-10 grad norms:")
+for name, comp, g in top:
+    print(f"{g:9.3f}  [{comp}]  {name}")

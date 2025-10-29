@@ -1,3 +1,5 @@
+import math
+from numbers import Real
 import numpy as np
 import torch
 import argparse
@@ -168,6 +170,38 @@ class Multinomial():
         lambdas = self.probs
         bayes_est = eval_regfunc(mu, lambdas, inputs.flatten()).reshape(inputs.shape)
         return bayes_est 
+    
+class GoofyPrior():
+    def __init__(self, args, device = "cpu", dtype=torch.float32):
+        # A should be theta_max, DIM should be seqlen
+        # For our early experiments, I suggest to pass C * log DIM as a single argument m
+        self.A = args.theta_max
+        self.DIM = args.seqlen
+        self.m = args.m
+        self.device = args.device
+        self.dtype = args.dtype
+    # For consistency, use torch to generate random samples rather than numpy 
+    def generate_support(self):
+        return torch.rand(self.m, device = self.device, dtype = self.dtype) * self.A # torch.rand generates [0, 1) so we scale it.
+
+    # Same for dirichlet
+    def generate_weights(self):
+        return torch.distributions.Dirichlet(torch.ones(self.m, device=self.device, dtype=self.dtype)).sample()
+
+    def gen_thetas(self, seed=None): # Fixed bug here :D
+        # Only need to generate supports and weights once
+        support = self.generate_support()
+        weights = self.generate_weights()
+
+        # Sample n indices according to weights
+        indices = torch.multinomial(weights, self.DIM, replacement=True) #apparently multinomial is more efficient
+
+        # Select atoms for each theta
+        thetas = support[indices]
+
+        # Return as torch tensor, matching expected shape
+        return thetas.reshape(1, self.DIM, 1).to(self.device)
+
 
 # Below is Prior on prior for multinomials, where the atoms are fixed but the probability follows dirichlet distribution. 
 class RandMultinomial(Multinomial):
@@ -259,7 +293,8 @@ if __name__ == "__main__":
     parser.add_argument('--seqlen', type=int, help='maximal length of the input');
     parser.add_argument('--alpha', type=float, help='alpha for dirichlet')
     parser.add_argument('--prior', type=str, help='prior we are using')
-    
+    parser.add_argument('--m', action='store_true', help='m = c * log DIM for goofy prior')
+    parser.add_argument('--n', type=int, default=1000, help='number of true parameters to generate')
     args = parser.parse_args();
     
     if torch.cuda.is_available():

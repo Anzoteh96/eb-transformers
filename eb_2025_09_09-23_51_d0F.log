@@ -1,0 +1,4 @@
+Using the following settings:
+ Namespace(dmodel=32, dinput=1, batch=192, theta_max=50, seqlen=512, weight_share=1, prior='neural', alpha=None, dirich_prob=None, mixture_level='batch', theta_max_israndom=False, step=0.5, layers=12, heads=4, activation='gelu', norm_share=False, decoding_layer_norm=False, att_activ='softmax', attn_only=False, no_prenorm=False, no_postnorm=False, train_steps=100000, train_lr=0.007, train_lr_epoch=400, train_lr_gamma=0.95, uniform_prior=False, nohist_thetas=False, num_padding=0, keep_stdout=False, tqdm_disable=False, store_temp_model=False, device='cpu', dtype=torch.float32, fname_prefix='eb_2025_09_09-23_51_d0F')
+Number of parameters: 12833
+EB trans: Using Adam, initial rate=0.007, eps = 0.01, interval=400, gamma=0.95
