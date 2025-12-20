@@ -51,7 +51,7 @@ if __name__ == "__main__":
 
     # Maybe we can still keep placket luce, idk. 
     ranks = mses_vals.argsort(axis = 0)
-    coefs = sgd_placket_luce.sgd_placket_luce(torch.from_numpy(ranks.T), max_iter = 1000)
+    coefs = sgd_placket_luce.sgd_placket_luce(torch.from_numpy(ranks.T), max_iter = 20000)
     coefs = coefs.cpu().detach().numpy()
     # Now we can put things together. 
     results_df = pd.DataFrame({"Model": mses_df.index, "mean": mses_avg, "std": mses_std, "coefs": coefs})

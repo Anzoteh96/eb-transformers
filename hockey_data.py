@@ -8,29 +8,13 @@ from tqdm import tqdm
 import pickle
 import math
 from eb_transformer import EBTransformer
-from tabpfn import TabPFNRegressor 
+#from tabpfn import TabPFNRegressor 
 import time
-from eb_arena_mapper import load_model_dict
+from utils import load_model_dict
 from algo_helpers import robbins, erm, npmle, fixed_grid_npmle
 from mlp import MLP
 
 os.environ['TABPFN_ALLOW_CPU_LARGE_DATASET'] = '1'
-
-# Helper function in reading hockey data.
-def read_hock_position(filename,position = None):
-    df = pd.read_csv(filename)
-    dfx = df[['Unnamed: 1', 'Scoring.1', 'Unnamed: 4']] #Goals
-    dfx = dfx[1:]
-    dfx.columns = ['name', 'goals', 'position']
-    dfx.set_index('name')
-    if position=="winger":
-        dfx = dfx.loc[(dfx["position"] == "LW") + (dfx["position"] == "RW")+(dfx["position"] == "W")]
-    if position == "center":
-        dfx = dfx.loc[(dfx["position"] == "C")]
-    if position == "defender":
-        dfx = dfx.loc[(dfx["position"] == "D")]
-    del dfx["position"];
-    return dfx
 
 # Allows for even more general processing of the hockey dataset (the dataset we scrap from the internet is probably too messy). 
 def process_hockey_csv(filename, position = None):
@@ -48,7 +32,8 @@ def process_hockey_csv(filename, position = None):
     dup_keywords = ['TOT'] + [str(i)+'TM' for i in range(2, 10)]
     dups = df["Rk"].duplicated(False)
     df = df[(~dups) | ((dups) & df[team_name].isin(dup_keywords))]
-    dfx = df[["Player", "G", "Pos"]]
+    #from
+    dfx = df[["Player", "PTS", "Pos"]]
     dfx.columns = ['name', 'goals', 'position']
     dfx = dfx.set_index('name')
     if position=="winger":

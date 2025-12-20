@@ -1,3 +1,5 @@
+## Nb. This is exclusively for training EB transformer models. 
+
 import argparse
 import datetime
 import gc
@@ -17,6 +19,8 @@ import tqdm
 import torch.nn.functional as F
 from eb_transformer import EBTransformer
 from gen_priors import DirichletProcess, RandMultinomial, NeuralPrior, ExponentialPrior
+from channels import slcp_channel, slcp_mle, two_moons_channel, inv_kinematrics_channel
+from gen_priors import Multinomial
 from algo_helpers import eval_regfunc
 
 
@@ -33,15 +37,25 @@ def get_n_params(model):
 
 def plot_thetas(args):
     print(f"Generating a few samples of the distributions of Thetas used")
+    # Idea: plot histograms of theta samples from the prior when dinput = 1, 
+    # and scatterplot when dinput = 2 (idk how to do for dinput > 2 that's for future.)
     fig, axs = plt.subplots(4, 4)
+    assert (args.dlabel <= 2), "dlabel > 2 is not supported for plotting yet."
     for ax in axs.flatten():
         _, prior = get_batch(args, return_prior = True)
-        thetas = prior.gen_thetas(args).cpu()
-        ax.hist(thetas.flatten().numpy(), bins=500, density=True)
-        ax.set_ylim([0, 0.2])
-        ax.set_xlim([0, args.theta_max])
+        thetas = prior.gen_thetas().cpu()
+        if args.dlabel == 2:
+            ax.scatter(thetas[:, :, 0].flatten().numpy(), thetas[:, :, 1].flatten().numpy(), alpha=0.1, s=1)
+            #ax.set_xlim([0, args.theta_max])
+            #ax.set_ylim([0, args.theta_max])
+            ax.set_aspect('equal', 'box')
+            continue
+        else:
+            ax.hist(thetas.flatten().numpy(), bins=500, density=True)
+            #ax.set_ylim([0, 0.2])
+            ax.set_xlim([0, args.theta_max])
 
-    axs.flatten()[0].set_title(f"B = {args.batch}, S={args.seqlen}, dim={args.dinput}")
+    axs.flatten()[0].set_title(f"B = {args.batch}, S={args.seqlen}, dim={args.dlabel}")
     # plt.show();
     fig.savefig(args.fname_prefix + "_thetas.png")
     plt.close(fig)
@@ -57,11 +71,11 @@ def get_batch(args, return_prior=False):
     # We give the users to retrieve prior; this is for the use of the BayesEst
     # (not the best codestyle but what other alternatives?)
 
-    batch, seqlen, theta_max, dinput = (
+    batch, seqlen, theta_max, dlabel= (
         args.batch,
         args.seqlen,
         args.theta_max,
-        args.dinput,
+        args.dlabel,
     )
     
     args.has_negative = (args.channel == "gaussian")
@@ -131,12 +145,18 @@ def get_batch(args, return_prior=False):
     
     # Think of how we want to support non-Poisson models. 
     channel = "poisson" if not ("channel" in args) else args.channel
-    assert channel in ["poisson", "gaussian"], (
-        f"Channel {channel} is not supported, only poisson and gaussian are supported"
+    assert channel in ["poisson", "gaussian", "slcp", "two_moons", "inverse_kinematics"], (
+        f"Channel {channel} is not supported, only poisson, gaussian, slcp, two_moons, inverse_kinematics are supported"
     )
     if channel == "gaussian":
         # For Gaussian, we sample from a normal distribution with mean = thetas and std = 1.
         inputs = torch.normal(mean=thetas, std=1.0).to(args.device)
+    elif channel == "slcp":
+        inputs = slcp_channel(thetas).to(args.device)
+    elif channel == "two_moons":
+        inputs = two_moons_channel(thetas).to(args.device)
+    elif channel == "inverse_kinematics":
+        inputs = inv_kinematrics_channel(thetas).to(args.device)
     else:
         # Here there will be a need to check that all thetas are nonnegative. 
         if torch.any(thetas < 0):
@@ -157,6 +177,28 @@ def get_batch(args, return_prior=False):
     else:
         return (inputs, labels)
 
+# Here, if we already have a prior, we can get it to generate arguments. 
+def get_batch_from_prior(prior, channel):
+    thetas = prior.gen_thetas()
+    if channel == "gaussian":
+        # For Gaussian, we sample from a normal distribution with mean = thetas and std = 1.
+        inputs = torch.normal(mean=thetas, std=1.0).to(args.device)
+    elif channel == "slcp":
+        inputs = slcp_channel(thetas).to(args.device)
+    elif channel == "two_moons":
+        inputs = two_moons_channel(thetas).to(args.device)
+    elif channel == "inverse_kinematics":
+        inputs = inv_kinematrics_channel(thetas).to(args.device)
+    else:
+        # Here there will be a need to check that all thetas are nonnegative. 
+        if torch.any(thetas < 0):
+            raise ValueError(
+                "Poisson channel requires all thetas to be nonnegative, but found negative thetas."
+            )
+        inputs = torch.poisson(thetas).to(args.device)
+    return inputs, thetas
+
+# Here, we want to train our EB transformer. 
 def train(args, model=None):
     if model is None:
         model = EBTransformer(args)
@@ -195,10 +237,24 @@ def train(args, model=None):
     clip_grad = 0
     loss_list = []
     norm_loss_list = [] # divided by MLE loss 
+
+    # In some instances, we also want to store our priors. 
+    reuse_prior = (args.num_priors is not None)
+    if reuse_prior:
+        priors = []
+
     for step in tqdm.tqdm(range(args.train_steps), disable=args.tqdm_disable):
         # model.param_report();
 
-        (inputs, labels) = get_batch(args)
+        if reuse_prior:
+            if step < args.num_priors:
+                (inputs, labels), prior = get_batch(args, return_prior = True)
+                priors.append(prior)
+            else:
+                prior = priors[step % args.num_priors]
+                (inputs, labels) = get_batch_from_prior(prior, args.channel)
+        else:
+            (inputs, labels) = get_batch(args)
         loss = model.eval_loss(inputs, labels, args.num_padding)
         optimizer.zero_grad()
         loss.backward()
@@ -214,7 +270,13 @@ def train(args, model=None):
 
         total_loss += loss.item()
         loss_list.append(loss.item())
-        mle_loss = ((inputs - labels) ** 2).sum() / inputs.numel()
+        if args.channel in ["gaussian", "poisson"]:
+            mle_ans = inputs
+        elif args.channel == "slcp":
+            mle_ans = slcp_mle(inputs, clamp = args.theta_max)
+        else: # No-op
+            mle_ans = torch.zeros_like(labels)
+        mle_loss = ((mle_ans - labels) ** 2).sum() / mle_ans.numel()
         norm_loss_list.append(loss.item() / mle_loss.item())
         total_mle_loss += mle_loss
         if step % args.train_lr_epoch == 0 and step > 0:
@@ -251,8 +313,10 @@ def train(args, model=None):
                     pickle.dump(outdict, f)
 
     # model.param_report();
-
-    return {"model": model, "loss": np.array(loss_list), "norm_loss": np.array(norm_loss_list)}
+    outdict = {"model": model, "loss": np.array(loss_list), "norm_loss": np.array(norm_loss_list)}
+    if reuse_prior:
+        outdict.update({"priors": priors})
+    return outdict
 
 def train_getbayes(args, model=None):
     assert(args.channel == "poisson"), "Currently only support poisson channel for train_getbayes"
@@ -378,7 +442,10 @@ if __name__ == "__main__":
         "--dmodel", type=int, default=32, help="dimensionality of each token"
     )
     parser.add_argument(
-        "--dinput", type=int, default=1, help="dimensionality of inputs and labels"
+        "--dinput", type=int, default=1, help="dimensionality of inputs"
+    )
+    parser.add_argument(
+        "--dlabel", type=int, default=None, help="dimensionality of labels"
     )
     parser.add_argument("--batch", type=int, default=192, help="number of batches")
     parser.add_argument(
@@ -471,6 +538,11 @@ if __name__ == "__main__":
     parser.add_argument(
         "--train_steps", type=int, default=100_000, help="Number of training steps"
     )
+
+    parser.add_argument(
+        "--num_priors", type=int, default=None, help="Number of priors to reuse during training"
+    )
+
     parser.add_argument(
         "--train_lr", type=float, default=0.007, help="Initial learning rate"
     )
@@ -511,9 +583,19 @@ if __name__ == "__main__":
     parser.add_argument(
         "--num_atoms", type=int, default=0, help="number of atoms for multinomial prior"
     )
+
+    parser.add_argument(
+        "--multin_dirich_param", type=float, default=1.0, help="Dirichlet parameter for multinomial prior"
+    )
+
     parser.add_argument(
         "--model_file", type=str, default=None, help="pretrained model file"
     )
+
+    parser.add_argument(
+        "--save_dir", type=str, default=None, help="directory to save/load models"
+    )
+
     args = parser.parse_args()
     if torch.cuda.is_available():
         args.device = "cuda"
@@ -521,6 +603,11 @@ if __name__ == "__main__":
         args.device = "cpu"
 
     args.dtype = torch.float32
+
+    if args.save_dir is not None: 
+        os.makedirs(args.save_dir, exist_ok=True)
+    if args.dlabel is None:
+        args.dlabel = args.dinput
     outdict = {
         "args": args,
     }
@@ -531,8 +618,9 @@ if __name__ == "__main__":
         plot_thetas(args)
 
     if not args.keep_stdout:
-        print(f"Using {fname_prefix}.log for stdout")
-        sys.stdout = open(fname_prefix + ".log", "wt")
+        log_filename = fname_prefix + ".log" if args.save_dir is None else os.path.join(args.save_dir, fname_prefix + ".log")
+        print(f"Using {log_filename} for stdout")
+        sys.stdout = open(log_filename, "wt")
 
     start_time = time.time()
 
@@ -562,7 +650,9 @@ if __name__ == "__main__":
             else:
                 main_res = train(args)
         outdict.update(main_res)
-        with open(fname_prefix + ".pkl", "wb") as f:
+        save_file = fname_prefix + ".pkl" if args.save_dir is None else os.path.join(args.save_dir, fname_prefix + ".pkl")
+        print(f"Storing final model to {save_file}")
+        with open(save_file, "wb") as f:
             pickle.dump(outdict, f)
 
         # Insert here something that generates validation plots (e.g. on hockey data, vs NPMLE, Robbins etc)

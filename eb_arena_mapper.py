@@ -12,27 +12,16 @@ import copy
 from eb_transformer import EBTransformer, custom_transformer
 from eb_transformer.temp_mha import TempMHA,  convert_model_mha_to_temp
 from eb_train import get_n_params
-#from mlp import MLP
+from baselines_code.mlp import MLP
 from gen_priors import NeuralPrior, DirichletProcess, WorstPrior
 import random
-from algo_helpers import robbins, erm_helper, erm, fixed_grid_npmle, eval_regfunc, npmle, james_stein
+from algo_helpers import robbins, erm_helper, erm, fixed_grid_npmle, eval_regfunc, npmle, james_stein, f_geb_est
 import sys
 import time
-from utils import load_model_dict, convert_tensor_to_bincount, model_input_bincounts
+from utils import set_seed, load_model_dict, convert_tensor_to_bincount, model_input_bincounts
+from channels import slcp_mle
 
 
-def set_seed(seed: int = 42) -> None:
-    #https://wandb.ai/sauravmaheshkar/RSNA-MICCAI/reports/How-to-Set-Random-Seeds-in-PyTorch-and-Tensorflow--VmlldzoxMDA2MDQy
-    np.random.seed(seed)
-    random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
-    # When running on the CuDNN backend, two further options must be set
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-    # Set a fixed value for the hash seed
-    os.environ["PYTHONHASHSEED"] = str(seed)
-    print(f"Random seed set as {seed}")
 
 # Sanity check: make sure that the MLP can also overfit into one prior. 
 # To do so we regurgitate the input-output pair from the same prior. 
@@ -69,7 +58,7 @@ def gen_batch_from_seed(args, return_prior = False):
     """
     # The purpose of returning prior is so that we can calculate BayesEst. 
     # For now this is not supported by mixtures.
-    assert args.channel in ["poisson", "gaussian"], "only Poisson and Gaussian channels are supported for now"
+    assert args.channel in ["poisson", "gaussian", "slcp"], "only Poisson, Gaussian, and SLCP channels are supported for now"
     set_seed(args.seed)
     prior = None # The prior we use. 
     if "worst_prior" in args and args.worst_prior:
@@ -81,9 +70,9 @@ def gen_batch_from_seed(args, return_prior = False):
         prior = args.prior
     else:
         if return_prior:
-            (_, labels), prior = eb_train.get_batch(args, True)
+            (inputs_start, labels), prior = eb_train.get_batch(args, True)
         else:
-            (_, labels) = eb_train.get_batch(args, False)
+            (inputs_start, labels) = eb_train.get_batch(args, False)
     if args.uniform_percentage > 0.0:
         assert(not return_prior), "Bayes est is not supported for uniform mixture / distribution shift yet"
         # We note here that we shouldn't mix uniform with Dirichlet prior/mixture, otherwise things will get messy. 
@@ -95,8 +84,10 @@ def gen_batch_from_seed(args, return_prior = False):
 
     if args.channel == "poisson":
         inputs = torch.poisson(labels)
-    else:
+    elif args.channel == "gaussian":
         inputs = torch.normal(mean = labels, std = 1)
+    else: # Only supporting SLCP now?
+        inputs = inputs_start
 
     #print(f"input share {inputs.shape}, labels shape {labels.shape}")
     if return_prior:
@@ -155,7 +146,7 @@ def get_batch_loss(model, args):
                 start = torch.cuda.Event(enable_timing=True)
                 end = torch.cuda.Event(enable_timing=True)
                 start.record()
-                if args.shrink_input_bincount:
+                if args.shrink_input_bincount and isinstance(model, EBTransformer):
                     outputs = args.func(model_input_bincounts(model, inputs))
                 else:
                     outputs = args.func(model(inputs))
@@ -229,9 +220,13 @@ def main():
     )
     
     parser.add_argument('--dmodel', type=int, default=32, help='dimensionality of each token')
-    parser.add_argument('--dinput', type=int, default=1, help='dimensionality of inputs and labels')
+    parser.add_argument('--dinput', type=int, default=1, help='dimensionality of inputs')
+    parser.add_argument('--dlabel', type=int, default=None, help='dimensionality of ilabels')
     parser.add_argument('--batch', type=int, default=192, help='number of batches')
     parser.add_argument('--theta_max', type=float, default=50, help='limit on the support of the prior')
+    parser.add_argument(
+        "--multin_dirich_param", type=float, default=1.0, help="Dirichlet parameter for multinomial prior"
+    )
     # Let's also add randomness for thetamax. 
     # In practice this is not used, since we usually evaluate it on priors with fixed thetamax. 
     parser.add_argument('--theta_max_israndom', action="store_true", help = "are thetamax random?")
@@ -242,6 +237,8 @@ def main():
     parser.add_argument('--out_file', type=str, default=None, help='file to output results to')
 
     args = parser.parse_args()
+    if args.dlabel is None:
+        args.dlabel = args.dinput
     args.mdl_name = args.model
     if torch.cuda.is_available():
         args.device = 'cuda'
@@ -268,15 +265,22 @@ def main():
         args.func = lambda x: torch.log(x + 1)
     else:
         args.func = lambda x: x
+    
+    def mle_channel(x):
+        if args.channel in ["poisson", "gaussian"]:
+            return x
+        elif args.channel in ["slcp"]:
+            return slcp_mle(x, clamp = args.theta_max)
 
-    benchmarks['mle'] = args.func
+    benchmarks['mle'] = lambda x: args.func(mle_channel(x))
     benchmarks['robbins'] = robbins
     benchmarks["erm"] = erm
     benchmarks["npmle"] = npmle
-    benchmarks["fixed_grid_npmle"] = (lambda x: fixed_grid_npmle(x, args.channel))
+    benchmarks["fixed_grid_npmle"] = (lambda x: fixed_grid_npmle(x, args.channel, args.shrink_input_bincount))
     benchmarks["bayes"] = "bayes"
     benchmarks["worst_prior"] = "worst_prior"
     benchmarks["james_stein"] = james_stein
+    benchmarks["f_geb_est"] = f_geb_est
 
     model = args.model
     mdl_name = ""

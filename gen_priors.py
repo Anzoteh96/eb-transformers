@@ -18,6 +18,7 @@ def gen_random_nn(args, has_negative = False):
     # but at the same time still allows a dynamic amount of batches/seqlen to be passed in. 
     # Required for Bayesest. 
     batch, seqlen, theta_max, dinput = args.batch, args.seqlen, args.theta_max, args.dinput
+    dlabel = args.dinput if args.channel in ["gaussian", "poisson"] else args.dlabel
     factory_kwargs = {'device': args.device, 'dtype': args.dtype}
     activations = [torch.nn.modules.GELU(), torch.nn.modules.ReLU(), 
             torch.nn.modules.SELU(), torch.nn.modules.CELU(),
@@ -25,10 +26,10 @@ def gen_random_nn(args, has_negative = False):
             torch.nn.modules.GELU(), torch.nn.modules.Tanh(),
             torch.nn.modules.Tanhshrink()];
     activation = np.random.choice(activations);
-    D1 = dinput*4;
+    D1 = dlabel*4;
     #inputs = torch.rand(batch, seqlen, D1, requires_grad = False, **factory_kwargs);
-    layer1 = torch.nn.Linear(D1,4*dinput, **factory_kwargs);
-    layer2 = torch.nn.Linear(4*dinput, dinput, **factory_kwargs);
+    layer1 = torch.nn.Linear(D1,4*dlabel, **factory_kwargs);
+    layer2 = torch.nn.Linear(4*dlabel, dlabel, **factory_kwargs);
     #TODO:there's probably a better way to do this so we can save weights and inspect them later
     def nn():
         inputs = torch.rand(batch, seqlen, D1, requires_grad = False, **factory_kwargs);
@@ -126,20 +127,20 @@ class BasePrior():
         # Can we possibly pass in a new "batch" param into gen_thetas?
         num_repeats = 1000 if channel == "poisson" else 50
         labels = torch.concatenate([self.gen_thetas() for _ in range(num_repeats)]) # Tried 20000 but got OOM. 
-        mu = labels.reshape(-1, self.dinput) if self.dinput > 1 else labels.flatten()
+        mu = labels.reshape(-1, self.dlabel) if self.dlabel > 1 else labels.flatten()
         lambdas = torch.ones(mu.shape[0]).to(labels.device) / mu.shape[0]
         if channel == "poisson":
-            if self.dinput > 1:
+            if self.dlabel > 1:
                 # Welps maybe we just have to rely on the fact that the "quantized" values are not too many. 
                 # But if it does get to 4 dimensions, oh well. 
                 unique_Q, probs = quantize_and_count(mu, eps=0.01, mode="round") 
-                bayes_est = eval_regfunc_multidim(unique_Q, probs, inputs.reshape(-1, self.dinput)).reshape(inputs.shape)
+                bayes_est = eval_regfunc_multidim(unique_Q, probs, inputs.reshape(-1, self.dlabel)).reshape(inputs.shape)
             else:
                 bayes_est = eval_regfunc(mu, lambdas, inputs.flatten()).reshape(inputs.shape)
         else:
-            unique_Q, probs = quantize_and_count(mu.reshape(-1, self.dinput), eps=0.0001, mode="round")
-            if self.dinput > 1:
-                bayes_est = eval_regfunc_gaussian(unique_Q, probs, inputs.reshape(-1, self.dinput)).reshape(inputs.shape)
+            unique_Q, probs = quantize_and_count(mu.reshape(-1, self.dlabel), eps=0.0001, mode="round")
+            if self.dlabel > 1:
+                bayes_est = eval_regfunc_gaussian(unique_Q, probs, inputs.reshape(-1, self.dlabel)).reshape(inputs.shape)
             else:
                 bayes_est = eval_regfunc_gaussian(unique_Q.flatten(), probs, inputs.flatten()).reshape(inputs.shape)
             # bayes_est = eval_regfunc_gaussian(mu, lambdas, inputs.flatten()).reshape(inputs.shape)
@@ -150,7 +151,7 @@ class BasePrior():
     def get_cov_est(self):
         num_repeats = 1000
         labels = torch.concatenate([self.gen_thetas() for _ in range(num_repeats)]) # Tried 20000 but got OOM. 
-        mu = labels.reshape(-1, self.dinput)
+        mu = labels.reshape(-1, self.dlabel)
         return torch.cov(mu.T), torch.corrcoef(mu.T)
 
 
@@ -161,6 +162,7 @@ class NeuralPrior(BasePrior):
         self.args = args
         self.batch, self.seqlen = args.batch, args.seqlen
         self.theta_max, self.dinput = args.theta_max, args.dinput
+        self.dlabel = args.dinput if args.channel in ["gaussian", "poisson"] else args.dlabel
         if args.theta_max_israndom:
             mu, std = self.theta_max, 10
             self.theta_max = gen_random_thetamax(mu, std, args.batch).reshape((args.batch, 1, 1))
@@ -172,14 +174,14 @@ class NeuralPrior(BasePrior):
             self.has_negative = (args.percent_negative > 0.2) if "percent_negative" in args else False
         self.nns = [gen_random_nn(args, self.has_negative) for _ in range(self.nr_mixtures)]
         if "rotate" in args and args.rotate:
-            q, _ = torch.linalg.qr(torch.randn(self.dinput, self.dinput).to(self.args.device))
+            q, _ = torch.linalg.qr(torch.randn(self.dlabel, self.dlabel).to(self.args.device))
             self.rot_mat = q
 
     def gen_thetas(self):
         final = self.nns[0]()
         for i in range(1, self.nr_mixtures):
             # TODO: figure out if we can generate different number of batches or seqlens. 
-            selector = torch.rand(self.batch, self.seqlen, self.dinput);
+            selector = torch.rand(self.batch, self.seqlen, self.dlabel);
             mask = selector < (1/self.nr_mixtures);
             out = self.nns[i]()
             final[mask] = out[mask]
@@ -213,6 +215,7 @@ class DirichletProcess(BasePrior):
             mu, std = theta_max, 10
             theta_max = gen_random_thetamax(mu, std, args.batch).reshape((args.batch, 1, 1))
         self.dinput = dinput
+        self.dlabel = args.dinput if args.channel in ["gaussian", "poisson"] else args.dlabel
         device = args.device
         if seed is not None:
             torch.manual_seed(seed)
@@ -262,6 +265,7 @@ class Multinomial(BasePrior):
         args = self.args 
         batch, seqlen, dinput = args.batch, args.seqlen, args.dinput  
         self.dinput = args.dinput
+        self.dlabel = args.dinput if args.channel in ["gaussian", "poisson"] else args.dlabel
         inds = torch.multinomial(self.probs, batch * seqlen, replacement = True).reshape(batch, seqlen)
         thetas = self.atoms[inds]
         if with_prob:
@@ -392,7 +396,7 @@ def sample_cartesian_without_replacement(
     return samples
 
 # Below is Prior on prior for multinomials, where the atoms are fixed but the probability follows dirichlet distribution. 
-# EDIT: let's also add support for dinput > 1. 
+# EDIT: let's also add support for dlabel > 1. 
 class RandMultinomial(Multinomial):
     def __init__(self, args):
         # Now let's figure out how do we initialize the atoms. 
@@ -410,17 +414,22 @@ class RandMultinomial(Multinomial):
                 atom_base = torch.rand(m) * 2 * args.theta_max - args.theta_max
             else:
                 atom_base = torch.rand(m) * args.theta_max
-        # Now we need to consider the dinput > 1 case.
-        if args.dinput > 1:
+        if args.channel in ["gaussian", "poisson"]:
+            args.dlabel = args.dinput 
+        # Now we need to consider the dlabel > 1 case.
+        if args.dlabel > 1:
             # We could do [M] x [M] x ... x [M] with grid size 0.1, but this is too unwieldy. 
             # Instead we can sample them. 
-            atom_base_lst = [atom_base for _ in range (args.dinput)]
+            atom_base_lst = [atom_base for _ in range (args.dlabel)]
             args.atoms = sample_cartesian_without_replacement(atom_base_lst, k = min(int(5 * len(atom_base[0])), int(1e4)), return_indices = False)
         else:
             args.atoms = atom_base.reshape(-1, 1)
         N = args.atoms.shape[0]
-        args.probs = Dirichlet(torch.ones(N)).sample()
+        args.probs = Dirichlet(args.multin_dirich_param * torch.ones(N)).sample()
         super().__init__(args)
+        # Finally let's remove probs and atoms_locations from args, otherwise we need to keep on updating them. 
+        del args.atoms
+        del args.probs
 
 # For bookcorpus purpose: zipf law. 
 class ZipfPrior(Multinomial):
@@ -546,6 +555,7 @@ class MultidimDirichlet(BasePrior):
         args = self.args
         batch, seqlen, dinput = args.batch, args.seqlen, args.dinput
         self.dinput = dinput
+        self.dlabel = args.dinput if args.channel in ["gaussian", "poisson"] else args.dlabel
         if seed is not None:
             torch.manual_seed(seed)
             torch.cuda.manual_seed(seed)

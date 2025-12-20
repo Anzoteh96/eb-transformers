@@ -1,7 +1,7 @@
 import torch
 import tqdm
 from .custom_transformer import MyMultiHeadAttention
-from linformer import LinformerSelfAttention
+# from linformer import LinformerSelfAttention
 from .temp_mha import TempMHA
 # import .avg_dot_product
 
@@ -96,6 +96,7 @@ class EBTransformer(torch.nn.Module):
                 ]
             )
         elif args.att_activ == "linformer":
+            from linformer import LinformerSelfAttention
             self.self_attn = torch.nn.ModuleList(
                 [
                     LinformerSelfAttention(
@@ -144,7 +145,7 @@ class EBTransformer(torch.nn.Module):
         if args.decoding_layer_norm:
             self.norm3 = torch.nn.LayerNorm(args.dmodel, **factory_kwargs)
 
-        self.decoder = torch.nn.Linear(args.dmodel, args.dinput, **factory_kwargs)
+        self.decoder = torch.nn.Linear(args.dmodel, args.dlabel, **factory_kwargs)
         self._init_params()
         return None
     def _init_params(self):

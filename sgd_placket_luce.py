@@ -18,8 +18,11 @@ def get_log_outcome_probability(weights, ranking):
 def sgd_placket_luce(
     argsort_out, lr=1e-1, thresh=1e-6, max_iter=100, c=0.01, debug=True, debug_out=""
 ):
+    # Override this so that we use CUDA if needed. 
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    argsort_out = argsort_out.to(device)
     weights = torch.randn(
-        argsort_out.shape[1], requires_grad=True
+        argsort_out.shape[1], requires_grad=True, device=device
     )  # might want to look into other initialization methods
     # print(weights)
     optimizer = torch.optim.Adam([weights], lr=lr)
@@ -46,7 +49,7 @@ def sgd_placket_luce(
         optimizer.step()
         if i % 100 == 0:
             scheduler.step()
-    return weights
+    return weights.detach().cpu()
 
 
 def get_adjacency_lists(rankings):
