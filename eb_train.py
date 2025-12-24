@@ -21,7 +21,7 @@ from eb_transformer import EBTransformer
 from gen_priors import DirichletProcess, RandMultinomial, NeuralPrior, ExponentialPrior
 from channels import slcp_channel, slcp_mle, two_moons_channel, inv_kinematrics_channel
 from gen_priors import Multinomial
-from algo_helpers import eval_regfunc
+from algo_helpers import eval_regfunc_poisson
 
 
 # Helper function that calculates the number of parameters.
@@ -363,7 +363,7 @@ def train_getbayes(args, model=None):
         inputs = torch.arange(max_tokens).float().to(args.device).reshape(1, -1, 1)
         # bayes_est = prior.gen_bayes_est(inputs.reshape(-1, 1), channel = args.channel)
         lambdas = labels.flatten()
-        bayes_est = eval_regfunc(lambdas, torch.ones_like(lambdas)/lambdas.numel(), inputs.reshape(-1, 1))
+        bayes_est = eval_regfunc_poisson(lambdas, torch.ones_like(lambdas)/lambdas.numel(), inputs.reshape(-1, 1))
         # Now we need to get the PMFs too. 
         # Now get the log PMF (scaled by constant).
         log_pmf_lst = [0]

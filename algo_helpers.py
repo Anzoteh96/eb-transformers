@@ -285,9 +285,46 @@ def f_geb_est(inputs, h = None, rho = 1e-4):
     result = inputs + g_hatp / denom
     return result
 
+def eval_loglikelihood_poisson(lambdas, mu, newXs):
+    """
+        Args: 
+            lambdas: numpy/torch, length M (atoms locations)
+            mu: numpy/torch, length M (atoms weights)
+            newXs: numpy/torch, length N
+        Returns:
+            ret: numpy/torch, length N
+    """
+    # First thing is to probably prune those lambdas that are 0.
+    # Reason being that we're taking the log of this lambdas later. 
+    lambdas_plus = (lambdas > 0)
+    lambdas_pruned = lambdas[lambdas_plus] # length M'
+    mu_pruned = mu[lambdas_plus] # length M'
+    is_torch = isinstance(lambdas, torch.Tensor)
+    if is_torch:
+        device = lambdas.device
+    m = len(lambdas_pruned);
+    loglam = torch.log(lambdas_pruned) if is_torch else np.log(lambdas_pruned)
+
+    max_Xs = int((1 + torch.max(newXs)).item()) if is_torch else 1 + np.max(newXs)
+    log_fdens_lst = torch.empty(max_Xs).to(device) if is_torch else np.empty(max_Xs)
+    log_fdens_lst[0] = torch.logsumexp(torch.log(mu) - lambdas, dim = 0) if is_torch else sp.special.logsumexp(np.log(mu) - lambdas)
+
+    for x in range(1, max_Xs):
+        if is_torch:
+            log_fdens_lst[x] = torch.logsumexp(torch.log(mu_pruned) - lambdas_pruned + x * loglam - torch.lgamma(torch.tensor([x + 1]).to(device)), dim = 0)
+        else:
+            log_fdens_lst[x] = sp.special.logsumexp(np.log(mu_pruned) - lambdas_pruned + x * loglam - sp.special.gammaln(x + 1))
+    
+    ret = torch.empty(len(newXs)).to(device) if is_torch else np.empty(len(newXs))
+    if is_torch:
+        ret = log_fdens_lst[newXs.long()]
+    else:
+        ret = log_fdens_lst[newXs.astype(np.uint64)]
+    return ret;
+
 # Now we consider the following function of computing the Poisson Bayes estimator. 
 
-def eval_regfunc(lambdas, mu, newXs):
+def eval_regfunc_poisson(lambdas, mu, newXs):
     """
         Args: 
             lambdas: numpy/torch, length M (atoms locations)
@@ -446,6 +483,44 @@ def eval_regfunc_nonint(lambdas, mu, newXs):
     
     ret = torch.exp(logret) if is_torch else np.exp(logret)
 
+    return ret
+
+# Now we consider the Gaussian case. In general we also want to calculate both the likelihood function and the bayes estimator. 
+def eval_loglikelihood_gaussian(lambdas, mu, newXs):
+    """
+        Args: 
+            lambdas: numpy/torch, length M (atoms locations)
+            mu: numpy/torch, length M (atoms weights)
+            newXs: numpy/torch, length N
+        Returns:
+            ret: numpy/torch, length N
+    """
+    is_torch = isinstance(lambdas, torch.Tensor)
+    multidim = len(lambdas.shape) > 1
+    if is_torch:
+        device = lambdas.device
+    m = lambdas.shape[0]
+    #loglam = torch.log(lambdas) if is_torch else np.log(lambdas)
+    n = newXs.shape[0]
+    fdens_lst = torch.empty(n).to(device) if is_torch else np.empty(n)
+    
+    for i in tqdm(range(n)):
+        x = newXs[i]
+        if is_torch:
+            if multidim:
+                density_exp = torch.exp(-0.5 * torch.sum((x - lambdas) ** 2, dim = 1)).to(device)
+                fdens_lst[i] = torch.sum(mu * density_exp)
+            else:
+                density_exp = torch.exp(-(x - lambdas) ** 2 / 2).to(device)
+                fdens_lst[i] = torch.sum(mu * density_exp)
+        else:
+            if multidim:
+                density_exp = np.exp(-0.5 * np.sum((x - lambdas) ** 2, axis = 1))
+                fdens_lst[i] = np.sum(mu * density_exp)
+            else:
+                density_exp = np.exp(-(x - lambdas) ** 2 / 2)
+                fdens_lst[i] = np.sum(mu * density_exp)
+    ret = fdens_lst 
     return ret
 
 def eval_regfunc_gaussian(lambdas, mu, newXs):
@@ -615,7 +690,7 @@ def eb_fixed_grid_npmle(train, test, channel, ngrid=None, weighted = False):
     # For Poisson, the inputs are all integers. Else we can formulate a function that takes noninteger?
     assert (channel in ["poisson", "gaussian"]), "non poisson/Gaussian channels are not supported"
     if channel == "poisson":
-        return eval_regfunc(grid, pi, test)
+        return eval_regfunc_poisson(grid, pi, test)
     return eval_regfunc_gaussian(grid, pi, test)
 
 

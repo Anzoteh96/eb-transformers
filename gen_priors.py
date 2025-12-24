@@ -1,7 +1,10 @@
 import numpy as np
 import torch
 import argparse
-from algo_helpers import eval_regfunc, eval_regfunc_gaussian, eval_regfunc_multidim
+from algo_helpers import (
+    eval_loglikelihood_poisson, eval_regfunc_poisson, eval_loglikelihood_gaussian, eval_regfunc_gaussian, eval_regfunc_multidim
+)
+
 import torch.nn as nn
 from torch.optim import Adam
 from torch.distributions.dirichlet import Dirichlet
@@ -120,6 +123,32 @@ class BasePrior():
     def gen_thetas(self):
         raise NotImplementedError
     
+    def eval_loglikelihood(self, inputs, channel):
+        B, N, D = inputs.shape
+        if not (channel in ["poisson", "gaussian"]):
+            raise NotImplementedError
+        num_repeats = 1000 if channel == "poisson" else 50
+        labels = torch.concatenate([self.gen_thetas() for _ in range(num_repeats)]) # Tried 20000 but got OOM. 
+        mu = labels.reshape(-1, self.dlabel) if self.dlabel > 1 else labels.flatten()
+        lambdas = torch.ones(mu.shape[0]).to(labels.device) / mu.shape[0]
+        assert self.dlabel == 1, "Only 1d loglikelihood is supported for now."
+        if channel == "poisson":
+            if self.dlabel > 1:
+                raise NotImplementedError
+                # Welps maybe we just have to rely on the fact that the "quantized" values are not too many. 
+                # But if it does get to 4 dimensions, oh well. 
+            else:
+                bayes_est = eval_loglikelihood_poisson(mu, lambdas, inputs.flatten()).reshape((B, N))
+        else:
+            unique_Q, probs = quantize_and_count(mu.reshape(-1, self.dlabel), eps=0.0001, mode="round")
+            if self.dlabel > 1:
+                bayes_est = eval_loglikelihood_gaussian(unique_Q, probs, inputs.reshape(-1, self.dlabel)).reshape((B, N))
+            else:
+                bayes_est = eval_loglikelihood_gaussian(unique_Q.flatten(), probs, inputs.flatten()).reshape((B, N))
+            # bayes_est = eval_regfunc_gaussian(mu, lambdas, inputs.flatten()).reshape(inputs.shape)
+        return bayes_est
+
+    
     def gen_bayes_est(self, inputs, channel = "poisson"):
         if not (channel in ["poisson", "gaussian"]):
             raise NotImplementedError
@@ -136,7 +165,7 @@ class BasePrior():
                 unique_Q, probs = quantize_and_count(mu, eps=0.01, mode="round") 
                 bayes_est = eval_regfunc_multidim(unique_Q, probs, inputs.reshape(-1, self.dlabel)).reshape(inputs.shape)
             else:
-                bayes_est = eval_regfunc(mu, lambdas, inputs.flatten()).reshape(inputs.shape)
+                bayes_est = eval_regfunc_poisson(mu, lambdas, inputs.flatten()).reshape(inputs.shape)
         else:
             unique_Q, probs = quantize_and_count(mu.reshape(-1, self.dlabel), eps=0.0001, mode="round")
             if self.dlabel > 1:
@@ -288,10 +317,26 @@ class Multinomial(BasePrior):
             if self.dinput > 1:
                 bayes_est = eval_regfunc_multidim(mu, lambdas, inputs.reshape(-1, self.dinput)).reshape(inputs.shape)
             else:
-                bayes_est = eval_regfunc(mu, lambdas, inputs.flatten()).reshape(inputs.shape)
+                bayes_est = eval_regfunc_poisson(mu.flatten(), lambdas.flatten(), inputs.flatten()).reshape(inputs.shape)
         else:
             bayes_est = eval_regfunc_gaussian(mu, lambdas, inputs.flatten()).reshape(inputs.shape)
         return bayes_est 
+    
+    def eval_loglikelihood(self, inputs, channel):
+        B, N, D = inputs.shape
+        if not (channel in ["poisson", "gaussian"]):
+            raise NotImplementedError
+        mu = self.atoms 
+        lambdas = self.probs
+
+        if channel == "poisson":
+            if self.dinput > 1:
+                raise NotImplementedError
+            else:
+                bayes_est = eval_loglikelihood_poisson(mu.flatten(), lambdas.flatten(), inputs.flatten()).reshape((B,N))
+        else:
+            bayes_est = eval_loglikelihood_gaussian(mu, lambdas, inputs.flatten()).reshape((B,N))
+        return bayes_est
 
 # Before that, we need a mechanism to sample cartesian product without creating the cartesian product itself. 
 # This is code written by ChatGPT. 
@@ -503,7 +548,7 @@ class WorstPrior():
         if self.args.dinput > 1 or not (channel in ["poisson", "gaussian"]):
             raise NotImplementedError
         if channel == "poisson":
-            bayes_est = eval_regfunc(self.support, self.probs, inputs.flatten()).reshape(inputs.shape)
+            bayes_est = eval_regfunc_poisson(self.support, self.probs, inputs.flatten()).reshape(inputs.shape)
         else:
             bayes_est = eval_regfunc_gaussian(self.support, self.probs, inputs.flatten()).reshape(inputs.shape)
         return bayes_est
@@ -534,7 +579,7 @@ class ExponentialPrior(BasePrior):
         if channel == "poisson" and self.dinput == 1:
             bayes_est = (inputs + 1) /(self.lambda_param + 1)
         elif channel == "poisson":
-            bayes_est = eval_regfunc(self.support, self.probs, inputs.flatten()).reshape(inputs.shape)
+            bayes_est = eval_regfunc_poisson(self.support, self.probs, inputs.flatten()).reshape(inputs.shape)
         else:
             bayes_est = eval_regfunc_gaussian(self.support, self.probs, inputs.flatten()).reshape(inputs.shape)
         return bayes_est
