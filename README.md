@@ -1,6 +1,9 @@
-# Solving Empirical Bayes via Transformers
+# Empirical Bayes, transformers, and Bayesian inference. 
 
-This work is from our [paper](https://arxiv.org/abs/2502.09844). 
+This repo is based on the following two papers: 
+
+- [Solving empirical Bayes via Transformers](https://arxiv.org/abs/2502.09844). 
+- [Universal priors: solving empirical Bayes via Bayesian inference and pretraining](https://arxiv.org/abs/2602.15136). Accepted to COLT, 2026. 
 
 ## Selected Models
 
@@ -13,7 +16,23 @@ These should be inside `requirements.txt` (other than the standard ones).
 
 ## Training Details
 
-The training process is implemented in `eb_train.py`. 
+The training process is implemented in `eb_train.py`. In particular: 
+
+- For the neural-dirichlet mixture, we use the following settings. 
+
+  ```
+  python3 eb_train.py --nohist_thetas --train_steps 50000 --dmodel 32 --batch 200 --seqlen 512 --weight_share 0 --prior mixture --alpha 50 --dirich_prob 0.5 --layers 24 --heads 8 --train_lr 0.02 --train_lr_epoch 300 --train_lr_gamma 0.97 --decoding_layer_norm --theta_max 50.0 --theta_max_israndom 
+  ```
+  Note that `theta_max=50.0` is only a proxy of actual `theta_max` as we set `theta_max` to be random here. 
+
+- For the universal prior (discrete/multinomial prior with random atom locations), we use the following settings. 
+  
+  ```
+  python3 eb_train.py --nohist_thetas --train_steps 50000 --dmodel 32 --batch 200 --seqlen 512 --weight_share 0 --prior multinomial --atoms_locations uniform --num_atoms 10 --multin_dirich_param 1.0 --train_lr_epoch 300 --train_lr_gamma 0.99 --decoding_layer_norm --theta_max 50.0
+  ```
+  In particular, we choose 10 atoms following uniform distribution in [0, 50], and weights following Dirichlet(1, ..., 1). 
+
+For attention-only setting, just add `--attn_only` flag. For parameter sharing, change the `weight_share` flag to `N` where `N` is the number of distinct weights. 
 
 
 ## Evaluation Details
@@ -142,6 +161,37 @@ python3 bookcorpus_estimate.py --model selected_models/T24r.pkl --dataset_dir bo
 ```
 Note that filename is the root of the name of the book. 
 
+## Hierarchical Bayes comparison. 
+
+In this exercise, we numerically justify that a transformer pretrained on a simple PoP closely approximates the hierarchical Bayesian estimator, and fractional posterior in case train and test sequence lengths are different. This can be done by pretraining a transformer on a prior-on-priors (PoP) containing only a small number of priors. 
+
+### Format of priors. 
+
+Let `L` be the number of priors. Then this should be a pickle file of a dictionary containing the following fields: 
+
+- `atoms`: list of length L, each being a numpy array of size `M x 1`. 
+- `probs`: list of length L, each being a numpy array of size `M`. 
+
+
+### Training. 
+
+This is in the file `eb_train_fixedpriors.py`, e.g. using the following settings. 
+
+```
+python3 eb_train_fixedpriors.py --train_steps 200000 --dmodel 32 --batch 200 --seqlen [N] --theta_max 20 --weight_share 0 --prior_file [prior_file] --layers 24 --heads 8 --train_lr 0.02 --train_lr_epoch 300 --train_lr_gamma 0.99 --decoding_layer_norm --save_dir [savedir]
+```
+
+where [N] is your desired training sequence length (we played around with training sequence length), [prior_file] is the pickle file of priors, and savedir is where you want to save your model. 
+
+### Evaluation. 
+
+This is via the `hierarchical.py` script, e.g. with the following commands. 
+
+```
+python3 hierarchical.py --model [pickle file of transformer model] --test_seqlen [list of test sequence lengths] --csv_file [where_to_store_csv] --batch [num_batches]
+```
+Again, `--shrink_input_bincount` can be added to accelerate the evaluation process. 
+
 ## BibTeX Citation
 
 If you use our work, we would appreciate using the following citations: 
@@ -152,6 +202,15 @@ If you use our work, we would appreciate using the following citations:
       author={Teh, Anzo and Jabbour, Mark and Polyanskiy, Yury},
       journal={arXiv preprint arXiv:2502.09844},
       year={2025}
+}
+```
+
+```
+@article{cannella2026universal,
+  title={Universal priors: solving empirical Bayes via Bayesian inference and pretraining},
+  author={Cannella, Nick and Teh, Anzo and Han, Yanjun and Polyanskiy, Yury},
+  journal={arXiv preprint arXiv:2602.15136},
+  year={2026}
 }
 ```
 
